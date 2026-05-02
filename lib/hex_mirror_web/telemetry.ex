@@ -34,7 +34,10 @@ defmodule HexMirrorWeb.Telemetry do
       summary("phoenix.socket_connected.duration", unit: {:native, :millisecond}),
       sum("phoenix.socket_drain.count"),
       summary("phoenix.channel_joined.duration", unit: {:native, :millisecond}),
-      summary("phoenix.channel_handled_in.duration", tags: [:event], unit: {:native, :millisecond}),
+      summary("phoenix.channel_handled_in.duration",
+        tags: [:event],
+        unit: {:native, :millisecond}
+      ),
       summary("vm.memory.total", unit: {:byte, :kilobyte}),
       summary("vm.total_run_queue_lengths.total"),
       summary("vm.total_run_queue_lengths.cpu"),

@@ -10,7 +10,9 @@ defmodule HexMirrorWeb.MirrorControllerTest do
 
     on_exit(fn ->
       File.rm_rf!(tmp)
-      if prev, do: Application.put_env(:hex_mirror, :tarball_path, prev),
+
+      if prev,
+        do: Application.put_env(:hex_mirror, :tarball_path, prev),
         else: Application.delete_env(:hex_mirror, :tarball_path)
     end)
 
