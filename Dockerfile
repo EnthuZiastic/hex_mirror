@@ -12,8 +12,10 @@ RUN apk add --no-cache build-base git
 
 WORKDIR /app
 
-RUN mix local.hex --force && \
-    mix local.rebar --force
+# hex + rebar are pre-installed in hexpm/elixir base images. Refreshing them
+# via `mix local.hex --force` crashes Erlang's user_drv under QEMU x86_64
+# emulation on Apple Silicon (kernel start_failure: nouser). Skip the refresh
+# — the bundled versions are already pinned to the base image release.
 
 ENV MIX_ENV="prod"
 

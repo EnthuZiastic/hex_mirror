@@ -1,0 +1,112 @@
+name: Build Image
+
+# Builds the production Phoenix release container and pushes it to ECR.
+#
+# Triggers:
+#   - push to master                : auto-build every merge
+#   - workflow_dispatch (with tag)  : manually rebuild a specific commit
+#
+# Tags pushed: <git-sha-short> (immutable) + `latest` (rolling).
+# The hex-mirror-prod ECR repo is configured with image_tag_mutability=IMMUTABLE,
+# so the SHA tag is permanent. `latest` is mutable and always points at the
+# most recent build for convenience; deploys must reference the SHA tag.
+#
+# Runner: shared k8s self-hosted pool (amd64 native, fast). Cross-arch QEMU
+# emulation does not work for Erlang — see Dockerfile note.
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "README.md"
+      - "CLAUDE.md"
+      - ".github/**"
+  workflow_dispatch:
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, standard, 4gb]
+    timeout-minutes: 30
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          show-progress: false
+
+      - name: Compute short SHA
+        id: sha
+        shell: bash
+        run: echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-south-1
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Set writable Docker config dir
+        shell: bash
+        run: |
+          DOCKER_DIR="/tmp/docker-config-${{ github.run_id }}"
+          mkdir -p "$DOCKER_DIR"
+          echo "DOCKER_CONFIG=$DOCKER_DIR" >> $GITHUB_ENV
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      - name: Build and push image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: hex-mirror-prod
+          SHORT_SHA: ${{ steps.sha.outputs.short }}
+        run: |
+          SHA_REF="${ECR_REGISTRY}/${ECR_REPOSITORY}:${SHORT_SHA}"
+          LATEST_REF="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+
+          # No registry buildcache: hex-mirror-prod is image_tag_mutability=IMMUTABLE,
+          # so re-pushing a stable cache tag would be rejected after the first build.
+          # Phoenix releases compile in ~3-5 min on this runner; the cache speed-up
+          # is not worth a separate mutable cache repo.
+          echo "Building ${SHA_REF}..."
+          docker buildx build \
+            -t "${SHA_REF}" \
+            -t "${LATEST_REF}" \
+            --push \
+            .
+          echo "Pushed ${SHORT_SHA} and latest"
+
+      - name: Summary
+        if: success()
+        shell: bash
+        env:
+          SHORT_SHA: ${{ steps.sha.outputs.short }}
+        run: |
+          {
+            echo "## Image pushed"
+            echo ""
+            echo "- Tag: \`${SHORT_SHA}\`"
+            echo "- Repo: \`hex-mirror-prod\`"
+            echo ""
+            echo "Deploy with:"
+            echo '```'
+            echo "just tf-apply aws/services/forgejo/prod prod -var hex_mirror_image_tag=${SHORT_SHA} -var hex_mirror_enabled=true"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
