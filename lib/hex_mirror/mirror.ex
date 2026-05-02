@@ -3,6 +3,12 @@ defmodule HexMirror.Mirror do
   Downloads the hex.pm registry payloads and every package tarball to
   `HexMirror.tarball_path/0`. Raw signed payloads are saved verbatim so the
   mirror can re-serve byte-identical bytes (signatures preserved).
+
+  Registry payloads (`/public_key`, `/names`, `/versions`, `/packages/<name>`)
+  are revalidated each sweep with `If-None-Match` / `If-Modified-Since`. A 304
+  reuses the on-disk body and skips downstream work; a 200 rewrites the body
+  and the sidecar `.meta` (etag + last-modified) used on the next sweep.
+  Tarballs are immutable per name+version, so existence on disk is enough.
   """
 
   require Logger
@@ -12,17 +18,32 @@ defmodule HexMirror.Mirror do
 
   @doc """
   Single sweep: refresh public key, /names, /versions, every /packages/<name>,
-  then download any new tarballs. Idempotent — files already on disk are skipped.
+  then download any new tarballs. Idempotent — files already on disk are
+  skipped, and conditional GETs avoid redownloading unchanged registry payloads.
   """
   def fetch do
     ensure_dirs()
 
-    with {:ok, public_key} <- fetch_public_key(),
-         {:ok, names_body} <- get_and_save("/names", HexMirror.names_path()),
-         {:ok, _versions_body} <- get_and_save("/versions", HexMirror.versions_path()),
-         {:ok, package_names} <- decode_names(names_body, public_key) do
-      Enum.each(package_names, &fetch_package(&1, public_key))
-      :ok
+    with {:ok, public_key, _} <- fetch_public_key(),
+         {:ok, names_body, _} <- get_and_save("/names", HexMirror.names_path()),
+         {:ok, _versions_body, versions_freshness} <-
+           get_and_save("/versions", HexMirror.versions_path()) do
+      case versions_freshness do
+        :not_modified ->
+          Logger.debug("/versions unchanged, skipping per-package sweep")
+          :ok
+
+        :fresh ->
+          case decode_names(names_body, public_key) do
+            {:ok, package_names} ->
+              Enum.each(package_names, &fetch_package(&1, public_key))
+              :ok
+
+            {:error, reason} ->
+              Logger.error("mirror sweep aborted: #{inspect(reason)}")
+              {:error, reason}
+          end
+      end
     else
       {:error, reason} ->
         Logger.error("mirror sweep aborted: #{inspect(reason)}")
@@ -37,21 +58,32 @@ defmodule HexMirror.Mirror do
   end
 
   defp fetch_public_key do
-    case Req.get(@repo_url <> "/public_key", decode_body: false) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        File.write!(HexMirror.public_key_path(), body)
-        {:ok, body}
-
-      other ->
-        {:error, {:public_key, other}}
+    case conditional_get("/public_key", HexMirror.public_key_path()) do
+      {:ok, body, freshness} -> {:ok, body, freshness}
+      other -> {:error, {:public_key, other}}
     end
   end
 
-  defp get_and_save(path, save_to) do
-    case Req.get(@repo_url <> path, decode_body: false) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
+  defp get_and_save(path, save_to), do: conditional_get(path, save_to)
+
+  defp conditional_get(path, save_to) do
+    headers = conditional_headers(save_to)
+
+    case Req.get(@repo_url <> path, decode_body: false, headers: headers) do
+      {:ok, %Req.Response{status: 304}} ->
+        case File.read(save_to) do
+          {:ok, body} ->
+            {:ok, body, :not_modified}
+
+          {:error, reason} ->
+            Logger.warning("304 for #{path} but cache unreadable: #{inspect(reason)}")
+            {:error, {:cache_miss_after_304, path}}
+        end
+
+      {:ok, %Req.Response{status: 200, body: body} = resp} ->
         File.write!(save_to, body)
-        {:ok, body}
+        write_meta(save_to, resp)
+        {:ok, body, :fresh}
 
       {:ok, %Req.Response{status: status}} ->
         Logger.warning("GET #{path} returned status #{status}")
@@ -83,7 +115,10 @@ defmodule HexMirror.Mirror do
     save_path = HexMirror.package_path(name)
 
     case get_and_save("/packages/#{name}", save_path) do
-      {:ok, body} ->
+      {:ok, _body, :not_modified} ->
+        :unchanged
+
+      {:ok, body, :fresh} ->
         case decode_package(body, name, public_key) do
           {:ok, versions} ->
             Enum.each(versions, fn version -> fetch_tarball(name, version) end)
@@ -135,8 +170,61 @@ defmodule HexMirror.Mirror do
   @doc "Names of every package present locally (best-effort, derived from /packages dir)."
   def local_packages do
     case File.ls(HexMirror.packages_dir()) do
-      {:ok, entries} -> Enum.sort(entries)
-      _ -> []
+      {:ok, entries} ->
+        entries
+        |> Enum.reject(&String.ends_with?(&1, ".meta"))
+        |> Enum.sort()
+
+      _ ->
+        []
+    end
+  end
+
+  defp meta_path(file), do: file <> ".meta"
+
+  defp read_meta(file) do
+    with true <- File.exists?(file),
+         {:ok, bin} <- File.read(meta_path(file)),
+         {:safe, term} <- {:safe, safe_term(bin)} do
+      term
+    else
+      _ -> %{}
+    end
+  end
+
+  defp safe_term(bin) do
+    try do
+      :erlang.binary_to_term(bin, [:safe])
+    rescue
+      _ -> %{}
+    end
+  end
+
+  defp write_meta(file, %Req.Response{} = resp) do
+    meta = %{
+      etag: header(resp, "etag"),
+      last_modified: header(resp, "last-modified")
+    }
+
+    File.write!(meta_path(file), :erlang.term_to_binary(meta))
+  end
+
+  defp conditional_headers(save_to) do
+    meta = read_meta(save_to)
+
+    []
+    |> maybe_put("if-none-match", Map.get(meta, :etag))
+    |> maybe_put("if-modified-since", Map.get(meta, :last_modified))
+  end
+
+  defp maybe_put(headers, _name, nil), do: headers
+  defp maybe_put(headers, _name, ""), do: headers
+  defp maybe_put(headers, name, value), do: [{name, value} | headers]
+
+  defp header(%Req.Response{} = resp, name) do
+    case Req.Response.get_header(resp, name) do
+      [value | _] -> value
+      _ -> nil
     end
   end
 end
