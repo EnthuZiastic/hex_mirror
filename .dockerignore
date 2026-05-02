@@ -1,0 +1,17 @@
+_build/
+deps/
+.elixir_ls/
+.git/
+.github/
+.gitignore
+cover/
+doc/
+tarballs/
+test/
+tmp/
+.formatter.exs
+.tool-versions
+README.md
+CLAUDE.md
+Dockerfile
+.dockerignore
