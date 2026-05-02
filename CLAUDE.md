@@ -4,36 +4,67 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`hex_mirror` is a Phoenix 1.2 / Elixir ~> 1.2 app that mirrors hex.pm: it downloads the registry and every package tarball to local disk and re-serves them so other developers (or CI) can run `mix hex.config mirror_url http://<this-host>` and pull deps from this mirror instead of repo.hex.pm.
+`hex_mirror` is a self-hosted mirror of [hex.pm](https://hex.pm). It downloads the signed registry payloads and every package tarball to disk, then re-serves them **byte-identical** so upstream signatures keep verifying. Originally for [elixir.camp](http://elixir.camp) — offline venue, clients fetch deps with no internet.
 
-This is a pre-Phoenix-1.3 layout: app code lives in **`web/`** (controllers/views/router/templates) and **`lib/`** (OTP app, supervisor, worker, mirror logic) — there is no `lib/hex_mirror_web/`. Do not "modernize" the layout casually; the project deliberately stays on the old structure.
+Consumers point `mix` at it via `mix hex.config mirror_url http://<host>` (see README).
+
+## Stack
+
+- Elixir `~> 1.19`, OTP 28
+- Phoenix `~> 1.8.5` + LiveView `~> 1.0`, Bandit adapter
+- `:req` for HTTP, `:hex_core` (`:hex_registry`) for signed-payload decode
+- No database, no Ecto. Disk is the only persistence.
 
 ## Commands
 
-- `mix deps.get` — install deps. Phoenix 1.2 + cowboy 1.0 + httpoison 0.9 + `:hex` runtime app. Hex needs to be loaded as a runtime dep (`applications: [:hex, ...]`) so `Hex.Registry`/`Hex.Utils` are available at runtime.
-- `mix phoenix.server` — boot the endpoint AND start `HexMirror.MirrorWorker`, which auto-mirrors every 60s. Default save dir: `./tarballs` (~700MB+).
-- `mix fetch_packages` — one-shot mirror without booting the web server. Defined in `lib/tasks/fetch_packages.ex`; manually starts `HTTPoison` and `Hex` then calls `HexMirror.Mirror.fetch/0`.
-- `mix test` — Phoenix-generated view tests only (`test/views/*`). There is no test coverage for the mirror logic; treat any change to `HexMirror.Mirror` as untested.
-- No CI: `.github/workflows/` is empty. No formatter config, no credo config file (credo is a dep but unconfigured), no dialyzer.
+- `mix deps.get` — install deps.
+- `mix phx.server` — boots endpoint **and** `HexMirror.MirrorWorker` (auto-sweeps every 60s). Default save dir `./tarballs/` — first sweep is many GB and many minutes.
+- `mix fetch_packages` — one-shot mirror without web server. Starts `:req` and calls `HexMirror.Mirror.fetch/0`.
+- `mix test` — controller tests for `MirrorController` and `PageController` exist (`test/hex_mirror_web/controllers/`). `HexMirror.Mirror` itself has no tests — treat changes there as untested.
+- `mix format` — `.formatter.exs` is present.
+- No CI (`.github/workflows/` empty), no `.credo.exs`, no `.tool-versions` — Elixir/OTP version not pinned by repo.
 
 ## Architecture
 
-Two cooperating concerns share one OTP app (`HexMirror`, supervisor strategy `:one_for_one`):
+One OTP app (`HexMirror.Application`, `:one_for_one`) supervises:
+`HexMirrorWeb.Telemetry`, `DNSCluster`, `Phoenix.PubSub` (`HexMirror.PubSub`), `HexMirrorWeb.Endpoint`, `HexMirror.MirrorWorker`.
 
-1. **Mirroring side** — `lib/hex_mirror/mirror_worker.ex` is a GenServer that `Process.send_after`s itself every 60s and calls `HexMirror.Mirror.fetch/0`. `Mirror.fetch` calls `Hex.Utils.ensure_registry!()` then iterates `Hex.Registry.all_packages()` and downloads every version via `HTTPoison.get("https://repo.hex.pm/tarballs/#{pkg}-#{ver}.tar")`. Idempotent: skips files that already exist on disk. Errors are printed but not raised — a bad download does not stop the sweep.
-2. **Serving side** — `HexMirror.Endpoint` + `HexMirror.Router`. Two scopes:
-   - Browser scope (`/`, `/packages`) — HTML pages backed by `PageController`/`PackagesController`.
-   - Raw scope — `GET /registry.ets.gz` (RegistryController) and `GET /tarballs/:tarball` (TarballsController). These are the endpoints `mix` actually hits when a downstream uses this as `mirror_url`. Do not add the `:browser` pipeline (CSRF, sessions) to these — `mix` is not a browser.
+### Mirroring side — `lib/hex_mirror/`
 
-The download directory is resolved by `HexMirror.Mirror.tarball_path/0`:
-```
+- `MirrorWorker` (GenServer): `Process.send_after(self(), :download, interval)` after each fetch returns. Default interval `:timer.minutes(1)`. Real cadence = `interval + sweep_duration`, not a strict minute.
+- `Mirror.fetch/0` runs one sweep:
+  1. `ensure_dirs/0` creates tarball root + `packages/` + `tarballs/` subdirs. Uses `:ok = File.mkdir_p(...)` — **intentionally crashes** on failure. Don't soften.
+  2. Conditional GET `/public_key`, `/names`, `/versions` via `Req.get(..., decode_body: false, headers: If-None-Match/If-Modified-Since)`. Body written verbatim (signatures preserved); a sidecar `.meta` stores etag + last-modified for next sweep. 304 → reuse on-disk body. 200 → rewrite body + meta.
+  3. `:hex_registry.decode_and_verify_signed/2` then `:hex_registry.decode_names/2` (repository `"hexpm"`) yield package list.
+  4. For each package: conditional GET `/packages/<name>`, decode versions, then `Req.get("/tarballs/<name>-<ver>.tar")` for any tarball not already on disk (tarballs are immutable per name+version, so existence-on-disk is enough — no conditional GET).
+- Errors are logged, not raised — bad payload aborts that step but the supervisor stays up. Sweep returns `{:error, reason}` on early failure (public key / names / versions).
+
+### Serving side — `lib/hex_mirror_web/`
+
+`HexMirrorWeb.Router` has two scopes. **Do not merge them.**
+
+- `:browser` pipeline → `GET /` (`PageController`), `live "/packages"` (`PackagesLive`). HTML UI for humans.
+- `:mirror_api` pipeline (just `accepts ["*/*"]`, no CSRF / sessions) → `MirrorController` actions:
+  - `GET /public_key`
+  - `GET /names`
+  - `GET /versions`
+  - `GET /packages/:name`
+  - `GET /tarballs/:tarball`
+
+These mirror_api routes are what `mix` actually hits. Adding `:browser` to them (CSRF, sessions) breaks `mix`. The browser `live "/packages"` and the API `/packages/:name` don't collide — different segment counts.
+
+### Path resolution
+
+All disk paths derive from `HexMirror.tarball_path/0`:
+```elixir
 Application.get_env(:hex_mirror, :tarball_path, Path.expand("./tarballs"))
 ```
-Override in `config/*.exs` with `config :hex_mirror, tarball_path: "/some/path"` — never hardcode the path elsewhere.
+Subpaths: `HexMirror.public_key_path/0`, `names_path/0`, `versions_path/0`, `packages_dir/0`, `tarballs_dir/0`. Override via `config :hex_mirror, tarball_path: "/path"` or `HEX_MIRROR_TARBALL_PATH` env (read in `config/runtime.exs`). Never hardcode a path elsewhere.
 
-## Quirks worth knowing
+## Quirks
 
-- `ensure_tarball_dir/0` uses `:ok = File.mkdir_p(...)` — intentionally crashes on failure (commit 79e6412). Don't soften it.
-- The worker schedules the *next* tick only after the previous fetch returns. A full mirror sweep can take many minutes, so the real cadence is "60s + sweep duration", not strictly every minute.
-- README is the source of truth for the consumer-side workflow (`mix hex.config mirror_url ...` and how to unset it). Keep it in sync if you change ports/paths.
-- No `.tool-versions`, `.formatter.exs`, or `.credo.exs` — Elixir/OTP version is not pinned by the repo. Use a Phoenix 1.2-compatible Elixir (1.2–1.6 era) or expect compile failures from this old Phoenix.
+- Layout is the standard Phoenix 1.8 split (`lib/hex_mirror/` + `lib/hex_mirror_web/`). The legacy pre-1.3 `web/` tree was removed in the 1.8 upgrade — do not look for it.
+- `Mirror.fetch/0` writes raw signed bodies with `decode_body: false`. Don't switch to default decoding — round-tripping JSON/protobuf would break upstream signature verification on re-serve.
+- The sidecar `.meta` file is just `etag\nlast-modified`. If you change the format, `conditional_headers/1` must change too — the two are coupled.
+- `code_reloading?` block in `Endpoint` adds `Phoenix.CodeReloader`; `mix.exs` also lists `listeners: [Phoenix.CodeReloader]` for project-wide reload. Both are needed for dev reload.
+- README is the source of truth for the consumer-side workflow (`mix hex.config mirror_url ...`). Keep it in sync if you change ports or wire-protocol routes.
