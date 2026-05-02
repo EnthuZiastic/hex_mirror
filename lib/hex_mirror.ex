@@ -24,4 +24,13 @@ defmodule HexMirror do
 
   def package_path(name), do: Path.join(packages_dir(), name)
   def tarball_file_path(filename), do: Path.join(tarballs_dir(), filename)
+
+  @default_max_bytes 5 * 1024 * 1024 * 1024
+  @default_keep_versions 1
+
+  @doc "Hard cap on total tarball size after each sweep. Override via `HEX_MIRROR_MAX_BYTES`."
+  def max_bytes, do: Application.get_env(:hex_mirror, :max_bytes, @default_max_bytes)
+
+  @doc "Versions retained per package after cleanup. Override via `HEX_MIRROR_KEEP_VERSIONS`."
+  def keep_versions, do: Application.get_env(:hex_mirror, :keep_versions, @default_keep_versions)
 end

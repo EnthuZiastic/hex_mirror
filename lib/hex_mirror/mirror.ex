@@ -24,15 +24,124 @@ defmodule HexMirror.Mirror do
   def fetch do
     ensure_dirs()
 
-    with {:ok, public_key, _} <- fetch_public_key(),
-         {:ok, names_body, _} <- get_and_save("/names", HexMirror.names_path()),
-         {:ok, _versions_body, versions_freshness} <-
-           get_and_save("/versions", HexMirror.versions_path()) do
-      handle_versions(versions_freshness, names_body, public_key)
+    result =
+      with {:ok, public_key, _} <- fetch_public_key(),
+           {:ok, names_body, _} <- get_and_save("/names", HexMirror.names_path()),
+           {:ok, _versions_body, versions_freshness} <-
+             get_and_save("/versions", HexMirror.versions_path()) do
+        handle_versions(versions_freshness, names_body, public_key)
+      else
+        {:error, reason} ->
+          Logger.error("mirror sweep aborted: #{inspect(reason)}")
+          {:error, reason}
+      end
+
+    cleanup()
+    result
+  end
+
+  @doc """
+  Enforce retention policy on the tarball store. Two passes:
+
+    1. Per-package: keep the newest `HexMirror.keep_versions/0` versions of each
+       package (semver-ordered, descending). Older versions deleted.
+    2. Hard cap: if total tarball bytes still exceed `HexMirror.max_bytes/0`,
+       evict by oldest mtime first until under cap.
+
+  Errors are logged, not raised. Cleanup never aborts the sweep.
+  """
+  def cleanup(opts \\ []) do
+    max_bytes = Keyword.get(opts, :max_bytes, HexMirror.max_bytes())
+    keep_versions = Keyword.get(opts, :keep_versions, HexMirror.keep_versions())
+
+    survivors = prune_old_versions(keep_versions)
+    enforce_size_cap(survivors, max_bytes)
+    :ok
+  rescue
+    err ->
+      Logger.error("cleanup failed: #{inspect(err)}")
+      {:error, err}
+  end
+
+  defp prune_old_versions(keep_versions) do
+    HexMirror.tarballs_dir()
+    |> list_tarball_entries()
+    |> Enum.group_by(& &1.name)
+    |> Enum.flat_map(fn {_name, entries} ->
+      sorted = Enum.sort(entries, &version_desc/2)
+      {keep, drop} = Enum.split(sorted, keep_versions)
+      Enum.each(drop, &delete_entry/1)
+      keep
+    end)
+  end
+
+  defp enforce_size_cap(entries, max_bytes) do
+    total = Enum.reduce(entries, 0, fn e, acc -> acc + e.size end)
+
+    if total <= max_bytes do
+      :ok
     else
+      excess = total - max_bytes
+
+      entries
+      |> Enum.sort_by(& &1.mtime)
+      |> Enum.reduce_while(0, fn entry, removed ->
+        if removed >= excess do
+          {:halt, removed}
+        else
+          delete_entry(entry)
+          {:cont, removed + entry.size}
+        end
+      end)
+
+      :ok
+    end
+  end
+
+  defp list_tarball_entries(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.flat_map(&parse_entry(dir, &1))
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  @filename_re ~r/^(?<name>.+)-(?<version>\d+\.\d+\.\d+(?:[+\-][^\/]*)?)\.tar$/
+  defp parse_entry(dir, filename) do
+    path = Path.join(dir, filename)
+
+    with %{"name" => name, "version" => version_str} <-
+           Regex.named_captures(@filename_re, filename),
+         {:ok, version} <- Version.parse(version_str),
+         {:ok, %File.Stat{size: size, mtime: mtime}} <- File.stat(path, time: :posix) do
+      [
+        %{
+          path: path,
+          name: name,
+          version: version,
+          size: size,
+          mtime: mtime
+        }
+      ]
+    else
+      _ -> []
+    end
+  end
+
+  defp version_desc(a, b), do: Version.compare(a.version, b.version) != :lt
+
+  defp delete_entry(entry) do
+    case File.rm(entry.path) do
+      :ok ->
+        Logger.debug("evicted #{entry.path}")
+        :ok
+
       {:error, reason} ->
-        Logger.error("mirror sweep aborted: #{inspect(reason)}")
-        {:error, reason}
+        Logger.warning("evict #{entry.path} failed: #{inspect(reason)}")
+        :error
     end
   end
 

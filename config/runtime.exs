@@ -20,4 +20,12 @@ if config_env() == :prod do
   if tarball_path = System.get_env("HEX_MIRROR_TARBALL_PATH") do
     config :hex_mirror, tarball_path: tarball_path
   end
+
+  if max_bytes = System.get_env("HEX_MIRROR_MAX_BYTES") do
+    config :hex_mirror, max_bytes: String.to_integer(max_bytes)
+  end
+
+  if keep = System.get_env("HEX_MIRROR_KEEP_VERSIONS") do
+    config :hex_mirror, keep_versions: String.to_integer(keep)
+  end
 end
