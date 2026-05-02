@@ -28,23 +28,25 @@ defmodule HexMirror.Mirror do
          {:ok, names_body, _} <- get_and_save("/names", HexMirror.names_path()),
          {:ok, _versions_body, versions_freshness} <-
            get_and_save("/versions", HexMirror.versions_path()) do
-      case versions_freshness do
-        :not_modified ->
-          Logger.debug("/versions unchanged, skipping per-package sweep")
-          :ok
-
-        :fresh ->
-          case decode_names(names_body, public_key) do
-            {:ok, package_names} ->
-              Enum.each(package_names, &fetch_package(&1, public_key))
-              :ok
-
-            {:error, reason} ->
-              Logger.error("mirror sweep aborted: #{inspect(reason)}")
-              {:error, reason}
-          end
-      end
+      handle_versions(versions_freshness, names_body, public_key)
     else
+      {:error, reason} ->
+        Logger.error("mirror sweep aborted: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp handle_versions(:not_modified, _names_body, _public_key) do
+    Logger.debug("/versions unchanged, skipping per-package sweep")
+    :ok
+  end
+
+  defp handle_versions(:fresh, names_body, public_key) do
+    case decode_names(names_body, public_key) do
+      {:ok, package_names} ->
+        Enum.each(package_names, &fetch_package(&1, public_key))
+        :ok
+
       {:error, reason} ->
         Logger.error("mirror sweep aborted: #{inspect(reason)}")
         {:error, reason}
@@ -115,20 +117,19 @@ defmodule HexMirror.Mirror do
     save_path = HexMirror.package_path(name)
 
     case get_and_save("/packages/#{name}", save_path) do
-      {:ok, _body, :not_modified} ->
-        :unchanged
+      {:ok, _body, :not_modified} -> :unchanged
+      {:ok, body, :fresh} -> download_versions(body, name, public_key)
+      _ -> :skip
+    end
+  end
 
-      {:ok, body, :fresh} ->
-        case decode_package(body, name, public_key) do
-          {:ok, versions} ->
-            Enum.each(versions, fn version -> fetch_tarball(name, version) end)
+  defp download_versions(body, name, public_key) do
+    case decode_package(body, name, public_key) do
+      {:ok, versions} ->
+        Enum.each(versions, fn version -> fetch_tarball(name, version) end)
 
-          {:error, reason} ->
-            Logger.warning("decode package #{name} failed: #{inspect(reason)}")
-        end
-
-      _ ->
-        :skip
+      {:error, reason} ->
+        Logger.warning("decode package #{name} failed: #{inspect(reason)}")
     end
   end
 
@@ -184,20 +185,17 @@ defmodule HexMirror.Mirror do
 
   defp read_meta(file) do
     with true <- File.exists?(file),
-         {:ok, bin} <- File.read(meta_path(file)),
-         {:safe, term} <- {:safe, safe_term(bin)} do
-      term
+         {:ok, bin} <- File.read(meta_path(file)) do
+      safe_term(bin)
     else
       _ -> %{}
     end
   end
 
   defp safe_term(bin) do
-    try do
-      :erlang.binary_to_term(bin, [:safe])
-    rescue
-      _ -> %{}
-    end
+    :erlang.binary_to_term(bin, [:safe])
+  rescue
+    _ -> %{}
   end
 
   defp write_meta(file, %Req.Response{} = resp) do

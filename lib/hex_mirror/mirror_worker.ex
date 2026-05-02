@@ -16,14 +16,14 @@ defmodule HexMirror.MirrorWorker do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @impl true
+  @impl GenServer
   def init(opts) do
     interval = Keyword.get(opts, :interval, @default_interval)
     schedule_work(interval)
     {:ok, %{interval: interval}}
   end
 
-  @impl true
+  @impl GenServer
   def handle_info(:download, %{interval: interval} = state) do
     _ = HexMirror.Mirror.fetch()
     schedule_work(interval)

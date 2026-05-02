@@ -1,13 +1,13 @@
 defmodule HexMirrorWeb.PackagesLive do
   use HexMirrorWeb, :live_view
 
-  @impl true
+  @impl Phoenix.LiveView
   def mount(_params, _session, socket) do
     packages = HexMirror.Mirror.local_packages()
     {:ok, assign(socket, query: "", all: packages, packages: packages)}
   end
 
-  @impl true
+  @impl Phoenix.LiveView
   def handle_event("filter", %{"q" => query}, socket) do
     filtered =
       case String.trim(query) do
@@ -18,7 +18,7 @@ defmodule HexMirrorWeb.PackagesLive do
     {:noreply, assign(socket, query: query, packages: filtered)}
   end
 
-  @impl true
+  @impl Phoenix.LiveView
   def render(assigns) do
     ~H"""
     <h1>Packages ({length(@all)})</h1>

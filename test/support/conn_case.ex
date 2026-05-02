@@ -1,4 +1,9 @@
 defmodule HexMirrorWeb.ConnCase do
+  @moduledoc """
+  Test case template for controller tests. Provides a `conn` and imports the
+  usual `Plug.Conn` / `Phoenix.ConnTest` helpers.
+  """
+
   use ExUnit.CaseTemplate
 
   using do
