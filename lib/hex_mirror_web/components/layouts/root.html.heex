@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <.live_title default="HexMirror">
+      {assigns[:page_title]}
+    </.live_title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+      a { color: #663399; }
+      code, pre { background: #f4f4f4; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.9rem; }
+      pre { padding: 0.75rem; overflow-x: auto; }
+      input[type="search"] { width: 100%; padding: 0.5rem; font-size: 1rem; box-sizing: border-box; }
+      ul { padding-left: 1.25rem; }
+      .hero h1 { margin-bottom: 0.25rem; }
+    </style>
+  </head>
+  <body>
+    {@inner_content}
+  </body>
+</html>

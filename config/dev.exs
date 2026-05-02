@@ -1,34 +1,22 @@
-use Mix.Config
+import Config
 
-# For development, we disable any cache and enable
-# debugging and code reloading.
-#
-# The watchers configuration can be used to run external
-# watchers to your application. For example, we use it
-# with brunch.io to recompile .js and .css sources.
-config :hex_mirror, HexMirror.Endpoint,
-  http: [port: 4000],
-  debug_errors: true,
-  code_reloader: true,
+config :hex_mirror, HexMirrorWeb.Endpoint,
+  http: [ip: {127, 0, 0, 1}, port: 4000],
   check_origin: false,
-  watchers: [node: ["node_modules/brunch/bin/brunch", "watch", "--stdin",
-                    cd: Path.expand("../", __DIR__)]]
-
-
-# Watch static and templates for browser reloading.
-config :hex_mirror, HexMirror.Endpoint,
+  code_reloader: true,
+  debug_errors: true,
+  secret_key_base: "0V3Pu2zjV4f3rGzYqJ1m6lS2C8dN7sGbR8q2lZ4H8Yf3rGzYqJ1m6lS2C8dN7sGb",
+  watchers: [],
   live_reload: [
     patterns: [
-      ~r{priv/static/.*(js|css|png|jpeg|jpg|gif|svg)$},
-      ~r{priv/gettext/.*(po)$},
-      ~r{web/views/.*(ex)$},
-      ~r{web/templates/.*(eex)$}
+      ~r"priv/static/(?!uploads/).*(js|css|png|jpeg|jpg|gif|svg)$",
+      ~r"priv/gettext/.*(po)$",
+      ~r"lib/hex_mirror_web/(controllers|live|components)/.*(ex|heex)$"
     ]
   ]
 
-# Do not include metadata nor timestamps in development logs
 config :logger, :console, format: "[$level] $message\n"
 
-# Set a higher stacktrace during development. Avoid configuring such
-# in production as building large stacktraces may be expensive.
 config :phoenix, :stacktrace_depth, 20
+config :phoenix, :plug_init_mode, :runtime
+config :phoenix_live_view, debug_heex_annotations: true, enable_expensive_runtime_checks: true

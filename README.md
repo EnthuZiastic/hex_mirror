@@ -1,39 +1,61 @@
-# HexMirror
+HexMirror
+=========
 
-This is a small simple service to mirror hex.pm to the local disk.
+A self-hosted mirror of [hex.pm](https://hex.pm). Downloads the signed registry
+payloads (`/public_key`, `/names`, `/versions`, `/packages/<name>`) plus every
+package tarball to disk, then re-serves them byte-identical so the upstream
+signatures keep verifying.
 
-This was written for [elixir.camp](http://elxiir.camp),
-where there is no internet connection, and so needs to be
-able to work completely offline.
+Originally written for [elixir.camp](http://elixir.camp), where there is no
+internet connection and clients need to fetch deps fully offline.
+
+## Stack
+
+- Elixir ~> 1.19, OTP 28
+- Phoenix 1.8 + LiveView 1.0 (Bandit adapter)
+- `:req` for HTTP, `:hex_core` for registry decode
 
 ## Instructions
 
-1. Download it, setup deps and run
-
-```bash
-git clone git@github.com:aussiegeek/hex_mirror.git
-npm install
+```sh
 mix deps.get
-npm install
-mix phoenix.server
+mix phx.server      # boots web server + MirrorWorker (sweeps every 60s)
+# or one-shot, no web server:
+mix fetch_packages
 ```
 
-2. Wait. By default it will start mirroring automatically and save to
-`./tarballs`. As of July 2016, this will fetch ~700MB of data.
+The first sweep downloads every published package tarball — expect many GB of
+disk and a long initial run. Subsequent sweeps only fetch new releases.
 
-3. People that want to use your mirror will need to do this
-(assuming your local address is 'thingy.local'):
+Tarball storage defaults to `./tarballs`. Override per environment:
 
-```bash
-mix hex.config mirror_url http://thing.local
+```elixir
+# config/dev.exs
+config :hex_mirror, tarball_path: "/some/big/disk/hex"
 ```
 
-If you've finished using this mirror, you will want unset `mirror_url`:
+In production set `HEX_MIRROR_TARBALL_PATH` (see `config/runtime.exs`).
 
-```bash
-mix hex.config mirror_url
+## Pointing `mix` at this mirror
+
+```sh
+mix hex.config mirror_url http://localhost:4000
+# revert to upstream:
+mix hex.config mirror_url --delete
 ```
+
+The mirror exposes the modern hex.pm wire protocol:
+
+| Path | Purpose |
+|---|---|
+| `GET /public_key` | hex.pm signing pubkey |
+| `GET /names` | signed list of all package names |
+| `GET /versions` | signed list of all versions |
+| `GET /packages/:name` | signed metadata + release list for `:name` |
+| `GET /tarballs/:filename` | raw `pkg-version.tar` |
 
 ## TODO
-* [ ] Mirror hex installer
-* [ ] Configuration instructions
+
+- Parallel tarball downloads (current sweep is sequential)
+- ETag / If-Modified-Since handling so sweeps only refetch changed packages
+- Mirror hex installer

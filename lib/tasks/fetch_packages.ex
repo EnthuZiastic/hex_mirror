@@ -1,15 +1,12 @@
 defmodule Mix.Tasks.FetchPackages do
+  @moduledoc "Fetch the hex.pm registry and every package tarball once, then exit."
+  @shortdoc "Fetch packages"
+
   use Mix.Task
 
-  @shortdoc "Fetch packages"
-  @moduledoc """
-Mix task to fetch packages once and then exit
-"""
-  
-  def run(_) do
-    HTTPoison.start
-    Hex.start
-    
-    HexMirror.Mirror.fetch
+  @impl Mix.Task
+  def run(_args) do
+    Application.ensure_all_started(:req)
+    HexMirror.Mirror.fetch()
   end
 end
