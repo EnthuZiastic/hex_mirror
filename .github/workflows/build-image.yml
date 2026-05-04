@@ -6,10 +6,11 @@ name: Build Image
 #   - push to master                : auto-build every merge
 #   - workflow_dispatch (with tag)  : manually rebuild a specific commit
 #
-# Tags pushed: <git-sha-short> (immutable) + `latest` (rolling).
+# Tags pushed: <git-sha-short> only.
 # The hex-mirror-prod ECR repo is configured with image_tag_mutability=IMMUTABLE,
-# so the SHA tag is permanent. `latest` is mutable and always points at the
-# most recent build for convenience; deploys must reference the SHA tag.
+# so the SHA tag is permanent. Deploys reference the SHA tag directly — no
+# rolling `latest` tag is published (the immutable repo would reject the
+# second push).
 #
 # Runner: shared k8s self-hosted pool (amd64 native, fast). Cross-arch QEMU
 # emulation does not work for Erlang — see Dockerfile note.
@@ -79,7 +80,6 @@ jobs:
           SHORT_SHA: ${{ steps.sha.outputs.short }}
         run: |
           SHA_REF="${ECR_REGISTRY}/${ECR_REPOSITORY}:${SHORT_SHA}"
-          LATEST_REF="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
 
           # No registry buildcache: hex-mirror-prod is image_tag_mutability=IMMUTABLE,
           # so re-pushing a stable cache tag would be rejected after the first build.
@@ -88,10 +88,9 @@ jobs:
           echo "Building ${SHA_REF}..."
           docker buildx build \
             -t "${SHA_REF}" \
-            -t "${LATEST_REF}" \
             --push \
             .
-          echo "Pushed ${SHORT_SHA} and latest"
+          echo "Pushed ${SHORT_SHA}"
 
       - name: Summary
         if: success()
