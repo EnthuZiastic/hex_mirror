@@ -207,7 +207,7 @@ defmodule HexMirror.Mirror do
   end
 
   defp decode_names(body, public_key) do
-    case :hex_registry.decode_and_verify_signed(body, public_key) do
+    case :hex_registry.decode_and_verify_signed(maybe_gunzip(body), public_key) do
       {:ok, payload} ->
         case :hex_registry.decode_names(payload, @repository) do
           {:ok, %{packages: packages}} ->
@@ -221,6 +221,12 @@ defmodule HexMirror.Mirror do
         {:error, {:verify_names, err}}
     end
   end
+
+  # hex.pm serves signed registry payloads gzipped. We persist the gzipped bytes
+  # verbatim (so re-serve stays byte-identical and signatures verify upstream),
+  # but must gunzip locally before handing to :hex_registry.
+  defp maybe_gunzip(<<31, 139, 8, _::binary>> = body), do: :zlib.gunzip(body)
+  defp maybe_gunzip(body), do: body
 
   defp fetch_package(name, public_key) do
     save_path = HexMirror.package_path(name)
@@ -243,7 +249,8 @@ defmodule HexMirror.Mirror do
   end
 
   defp decode_package(body, name, public_key) do
-    with {:ok, payload} <- :hex_registry.decode_and_verify_signed(body, public_key),
+    with {:ok, payload} <-
+           :hex_registry.decode_and_verify_signed(maybe_gunzip(body), public_key),
          {:ok, %{releases: releases}} <-
            :hex_registry.decode_package(payload, @repository, name) do
       {:ok, Enum.map(releases, & &1.version)}
