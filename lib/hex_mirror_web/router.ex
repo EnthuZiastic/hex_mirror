@@ -11,6 +11,7 @@ defmodule HexMirrorWeb.Router do
   end
 
   pipeline :mirror_api do
+    plug(Plug.Logger)
     plug(:accepts, ["*/*"])
   end
 
