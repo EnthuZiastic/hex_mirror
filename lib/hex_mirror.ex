@@ -27,7 +27,7 @@ defmodule HexMirror do
 
   @default_max_bytes 5 * 1024 * 1024 * 1024
   @default_keep_versions 1
-  @default_unused_ttl_seconds 30 * 24 * 60 * 60
+  @default_unused_ttl_seconds 7 * 24 * 60 * 60
 
   @doc "Hard cap on total tarball size after each sweep. Override via `HEX_MIRROR_MAX_BYTES`."
   def max_bytes, do: Application.get_env(:hex_mirror, :max_bytes, @default_max_bytes)
