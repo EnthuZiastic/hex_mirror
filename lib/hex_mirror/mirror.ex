@@ -41,11 +41,16 @@ defmodule HexMirror.Mirror do
   end
 
   @doc """
-  Enforce retention policy on the tarball store. Two passes:
+  Enforce retention policy on the tarball store. Three passes:
 
     1. Per-package: keep the newest `HexMirror.keep_versions/0` versions of each
        package (semver-ordered, descending). Older versions deleted.
-    2. Hard cap: if total tarball bytes still exceed `HexMirror.max_bytes/0`,
+    2. Usage TTL: of the survivors, evict any whose mtime is older than
+       `HexMirror.unused_ttl_seconds/0`, except the single newest semver per
+       package which is always retained as a floor. mtime is bumped on every
+       fetch attempt and on every served request, so this evicts versions that
+       are neither current targets nor actively consumed.
+    3. Hard cap: if total tarball bytes still exceed `HexMirror.max_bytes/0`,
        evict by oldest mtime first until under cap.
 
   Errors are logged, not raised. Cleanup never aborts the sweep.
@@ -53,8 +58,14 @@ defmodule HexMirror.Mirror do
   def cleanup(opts \\ []) do
     max_bytes = Keyword.get(opts, :max_bytes, HexMirror.max_bytes())
     keep_versions = Keyword.get(opts, :keep_versions, HexMirror.keep_versions())
+    ttl_seconds = Keyword.get(opts, :unused_ttl_seconds, HexMirror.unused_ttl_seconds())
+    now = Keyword.get(opts, :now, :os.system_time(:second))
 
-    survivors = prune_old_versions(keep_versions)
+    survivors =
+      keep_versions
+      |> prune_old_versions()
+      |> evict_unused(ttl_seconds, now)
+
     enforce_size_cap(survivors, max_bytes)
     :ok
   rescue
@@ -72,6 +83,30 @@ defmodule HexMirror.Mirror do
       {keep, drop} = Enum.split(sorted, keep_versions)
       Enum.each(drop, &delete_entry/1)
       keep
+    end)
+  end
+
+  defp evict_unused(entries, ttl_seconds, _now) when ttl_seconds <= 0, do: entries
+
+  defp evict_unused(entries, ttl_seconds, now) do
+    cutoff = now - ttl_seconds
+
+    entries
+    |> Enum.group_by(& &1.name)
+    |> Enum.flat_map(fn {_name, group} ->
+      [newest | rest] = Enum.sort(group, &version_desc/2)
+
+      kept_rest =
+        Enum.filter(rest, fn entry ->
+          if entry.mtime < cutoff do
+            delete_entry(entry)
+            false
+          else
+            true
+          end
+        end)
+
+      [newest | kept_rest]
     end)
   end
 
@@ -241,11 +276,32 @@ defmodule HexMirror.Mirror do
   defp download_versions(body, name, public_key) do
     case decode_package(body, name, public_key) do
       {:ok, versions} ->
-        Enum.each(versions, fn version -> fetch_tarball(name, version) end)
+        # Fetch only the newest `keep_versions` releases per package. Without
+        # this cap, every fresh `/packages/<name>` (200) re-enumerated every
+        # historical version and `cleanup/1` would delete all but the newest
+        # straight after — burning bandwidth on an infinite refetch loop.
+        versions
+        |> select_newest_versions(HexMirror.keep_versions())
+        |> Enum.each(fn version -> fetch_tarball(name, version) end)
 
       {:error, reason} ->
         Logger.warning("decode package #{name} failed: #{inspect(reason)}")
     end
+  end
+
+  defp select_newest_versions(versions, keep) when keep <= 0, do: versions
+
+  defp select_newest_versions(versions, keep) do
+    versions
+    |> Enum.flat_map(fn v ->
+      case Version.parse(to_string(v)) do
+        {:ok, parsed} -> [{parsed, v}]
+        :error -> []
+      end
+    end)
+    |> Enum.sort(fn {a, _}, {b, _} -> Version.compare(a, b) != :lt end)
+    |> Enum.take(keep)
+    |> Enum.map(fn {_parsed, original} -> original end)
   end
 
   defp decode_package(body, name, public_key) do
@@ -264,6 +320,10 @@ defmodule HexMirror.Mirror do
     save_path = HexMirror.tarball_file_path(filename)
 
     if File.exists?(save_path) do
+      # Bump mtime so the usage-TTL prune treats current target versions as
+      # live. Without this, sweeps would never refresh mtime and ttl-evict
+      # would drop versions we still consider part of `keep_versions`.
+      _ = File.touch(save_path)
       :already_downloaded
     else
       Logger.info("downloading #{name} #{version}")
