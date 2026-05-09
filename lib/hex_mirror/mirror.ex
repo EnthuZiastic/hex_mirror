@@ -219,12 +219,13 @@ defmodule HexMirror.Mirror do
 
   defp handle_versions(:not_modified, _names_body, _public_key) do
     Logger.debug("/versions unchanged, skipping per-package sweep")
-    # Refresh mtimes of every on-disk tarball so the usage TTL pass treats a
-    # quiet upstream (no new releases for `unused_ttl_seconds`) as healthy
-    # rather than as evidence the keep-set is cold. Without this, a
-    # pre-populated PVC plus a quiet week of 304s on `/versions` would let
-    # `evict_unused/3` wipe everything except the floor-newest per package.
-    refresh_keep_set_mtimes()
+    # Refresh mtimes of every on-disk tarball whose mtime is already past the
+    # half-window threshold, so the usage TTL pass treats a quiet upstream
+    # (no new releases for `unused_ttl_seconds`) as healthy rather than as
+    # evidence the keep-set is cold. Without this, a pre-populated PVC plus
+    # a quiet week of 304s on `/versions` would let `evict_unused/3` wipe
+    # everything except the floor-newest per package.
+    refresh_stale_tarball_mtimes()
     :ok
   end
 
@@ -240,10 +241,32 @@ defmodule HexMirror.Mirror do
     end
   end
 
-  defp refresh_keep_set_mtimes do
-    HexMirror.tarballs_dir()
-    |> list_tarball_entries()
-    |> Enum.each(fn entry -> _ = File.touch(entry.path) end)
+  # Walks every tarball on disk and bumps mtime *only* when it has aged past
+  # half the usage-TTL window. This collapses the worst-case `:not_modified`
+  # IO from `N touches × every sweep` (~14M utimensat syscalls/day on a 10k-
+  # tarball PVC at 1-min sweep cadence) down to roughly `N / (ttl_seconds /
+  # 2 / sweep_interval_seconds)` per sweep — i.e. each tarball is touched at
+  # most once per half-window. Correctness still holds: as long as we touch
+  # before mtime crosses `now - unused_ttl_seconds`, the TTL pass keeps the
+  # entry. With a 7-day TTL (default) we have ~3.5 days of headroom between
+  # the touch threshold and the eviction cutoff. When the TTL pass is
+  # disabled (`unused_ttl_seconds <= 0`) the refresh is a no-op.
+  defp refresh_stale_tarball_mtimes do
+    case HexMirror.unused_ttl_seconds() do
+      ttl when ttl <= 0 ->
+        :ok
+
+      ttl ->
+        threshold = :os.system_time(:second) - div(ttl, 2)
+
+        HexMirror.tarballs_dir()
+        |> list_tarball_entries()
+        |> Enum.each(fn entry ->
+          if entry.mtime < threshold, do: _ = File.touch(entry.path)
+        end)
+
+        :ok
+    end
   end
 
   defp ensure_dirs do
