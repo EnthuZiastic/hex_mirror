@@ -36,7 +36,18 @@ defmodule HexMirror.Mirror do
           {:error, reason}
       end
 
-    cleanup()
+    case result do
+      :ok ->
+        cleanup()
+
+      {:error, _} ->
+        # Sweep failed (transport / decode error). Skip the TTL pass so a long
+        # upstream outage on a fresh pod cannot evict the keep-set, and skip
+        # the size cap so a misconfigured `max_bytes` cannot chew through the
+        # store while we are blind to upstream state.
+        :ok
+    end
+
     result
   end
 
@@ -54,6 +65,12 @@ defmodule HexMirror.Mirror do
        evict by oldest mtime first until under cap.
 
   Errors are logged, not raised. Cleanup never aborts the sweep.
+
+  Note: `fetch/0` only invokes `cleanup/1` when the sweep itself succeeded.
+  A failed sweep (transport / decode error) skips cleanup entirely so an
+  upstream outage on a fresh pod cannot evict the keep-set, and a
+  misconfigured `max_bytes` cannot chew through the store while we are blind
+  to upstream state. Manual `cleanup/1` callers always run all three passes.
   """
   def cleanup(opts \\ []) do
     max_bytes = Keyword.get(opts, :max_bytes, HexMirror.max_bytes())
@@ -72,6 +89,13 @@ defmodule HexMirror.Mirror do
     err ->
       Logger.error("cleanup failed: #{inspect(err)}")
       {:error, err}
+  end
+
+  defp prune_old_versions(keep_versions) when keep_versions <= 0 do
+    # `keep_versions <= 0` is treated as "unlimited" for symmetry with
+    # `select_newest_versions/2` on the fetch side. Without this clause,
+    # `Enum.split(_, 0)` would delete everything every sweep.
+    list_tarball_entries(HexMirror.tarballs_dir())
   end
 
   defp prune_old_versions(keep_versions) do
@@ -94,19 +118,23 @@ defmodule HexMirror.Mirror do
     entries
     |> Enum.group_by(& &1.name)
     |> Enum.flat_map(fn {_name, group} ->
-      [newest | rest] = Enum.sort(group, &version_desc/2)
+      case Enum.sort(group, &version_desc/2) do
+        [] ->
+          []
 
-      kept_rest =
-        Enum.filter(rest, fn entry ->
-          if entry.mtime < cutoff do
-            delete_entry(entry)
-            false
-          else
-            true
-          end
-        end)
+        [newest | rest] ->
+          kept_rest =
+            Enum.filter(rest, fn entry ->
+              if entry.mtime < cutoff do
+                delete_entry(entry)
+                false
+              else
+                true
+              end
+            end)
 
-      [newest | kept_rest]
+          [newest | kept_rest]
+      end
     end)
   end
 
@@ -144,6 +172,13 @@ defmodule HexMirror.Mirror do
     end
   end
 
+  # Splits `<name>-<version>.tar` into (name, version). Anchored on the
+  # trailing `.tar`, so the rightmost `<digit>+.<digit>+.<digit>+` segment
+  # before `.tar` is treated as the version. Hex package names are
+  # `[a-z][a-z0-9_]*` (no dots, no leading digits) so this anchor is
+  # unambiguous in practice — the regex would only mis-split if a package
+  # name itself ended in a semver-shaped suffix, which hex.pm's name policy
+  # forbids.
   @filename_re ~r/^(?<name>.+)-(?<version>\d+\.\d+\.\d+(?:[+\-][^\/]*)?)\.tar$/
   defp parse_entry(dir, filename) do
     path = Path.join(dir, filename)
@@ -162,7 +197,9 @@ defmodule HexMirror.Mirror do
         }
       ]
     else
-      _ -> []
+      reason ->
+        Logger.debug("parse_entry skipped #{filename}: #{inspect(reason)}")
+        []
     end
   end
 
@@ -182,6 +219,12 @@ defmodule HexMirror.Mirror do
 
   defp handle_versions(:not_modified, _names_body, _public_key) do
     Logger.debug("/versions unchanged, skipping per-package sweep")
+    # Refresh mtimes of every on-disk tarball so the usage TTL pass treats a
+    # quiet upstream (no new releases for `unused_ttl_seconds`) as healthy
+    # rather than as evidence the keep-set is cold. Without this, a
+    # pre-populated PVC plus a quiet week of 304s on `/versions` would let
+    # `evict_unused/3` wipe everything except the floor-newest per package.
+    refresh_keep_set_mtimes()
     :ok
   end
 
@@ -195,6 +238,12 @@ defmodule HexMirror.Mirror do
         Logger.error("mirror sweep aborted: #{inspect(reason)}")
         {:error, reason}
     end
+  end
+
+  defp refresh_keep_set_mtimes do
+    HexMirror.tarballs_dir()
+    |> list_tarball_entries()
+    |> Enum.each(fn entry -> _ = File.touch(entry.path) end)
   end
 
   defp ensure_dirs do
@@ -295,8 +344,12 @@ defmodule HexMirror.Mirror do
     versions
     |> Enum.flat_map(fn v ->
       case Version.parse(to_string(v)) do
-        {:ok, parsed} -> [{parsed, v}]
-        :error -> []
+        {:ok, parsed} ->
+          [{parsed, v}]
+
+        :error ->
+          Logger.debug("select_newest_versions: unparseable version #{inspect(v)}")
+          []
       end
     end)
     |> Enum.sort(fn {a, _}, {b, _} -> Version.compare(a, b) != :lt end)

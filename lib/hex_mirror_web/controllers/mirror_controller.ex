@@ -26,6 +26,9 @@ defmodule HexMirrorWeb.MirrorController do
     path = HexMirror.tarball_file_path(tarball)
     # Bump mtime on serve so HexMirror.Mirror.cleanup/1 can distinguish
     # actively consumed versions from cold ones when applying the usage TTL.
+    # The `File.exists?` guard is required: `File.touch/1` creates the file
+    # if missing, which would turn 404s into empty 200s and let an attacker
+    # planting bogus path params seed empty tarballs into the store.
     if File.exists?(path), do: _ = File.touch(path)
     send_mirror_file(conn, path, "application/octet-stream")
   end

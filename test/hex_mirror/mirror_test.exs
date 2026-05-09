@@ -108,6 +108,50 @@ defmodule HexMirror.MirrorTest do
     end
   end
 
+  describe "cleanup/1 floor invariant" do
+    test "newest semver per package always survives even when every version is stale" do
+      now = :os.system_time(:second)
+      ttl = 100
+      # All five versions are well past the TTL window.
+      write_tarball("foo", "1.0.0", now - 10_000)
+      write_tarball("foo", "1.1.0", now - 10_000)
+      write_tarball("foo", "2.0.0", now - 10_000)
+      write_tarball("foo", "2.5.0", now - 10_000)
+      write_tarball("foo", "3.0.0", now - 10_000)
+
+      :ok =
+        Mirror.cleanup(
+          keep_versions: 5,
+          unused_ttl_seconds: ttl,
+          max_bytes: 1_000_000_000,
+          now: now
+        )
+
+      remaining = HexMirror.tarballs_dir() |> File.ls!() |> Enum.sort()
+      assert remaining == ["foo-3.0.0.tar"]
+    end
+  end
+
+  describe "cleanup/1 keep_versions <= 0" do
+    test "treats keep_versions=0 as unlimited (does not delete everything)" do
+      now = :os.system_time(:second)
+      write_tarball("foo", "1.0.0", now)
+      write_tarball("foo", "2.0.0", now)
+      write_tarball("foo", "3.0.0", now)
+
+      :ok =
+        Mirror.cleanup(
+          keep_versions: 0,
+          unused_ttl_seconds: 0,
+          max_bytes: 1_000_000_000,
+          now: now
+        )
+
+      remaining = HexMirror.tarballs_dir() |> File.ls!() |> Enum.sort()
+      assert remaining == ["foo-1.0.0.tar", "foo-2.0.0.tar", "foo-3.0.0.tar"]
+    end
+  end
+
   describe "cleanup/1 max_bytes" do
     test "evicts oldest mtime first to fit cap" do
       now = :os.system_time(:second)
