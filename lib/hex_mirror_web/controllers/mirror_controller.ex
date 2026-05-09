@@ -23,7 +23,11 @@ defmodule HexMirrorWeb.MirrorController do
   end
 
   def tarball(conn, %{"tarball" => tarball}) do
-    send_mirror_file(conn, HexMirror.tarball_file_path(tarball), "application/octet-stream")
+    path = HexMirror.tarball_file_path(tarball)
+    # Bump mtime on serve so HexMirror.Mirror.cleanup/1 can distinguish
+    # actively consumed versions from cold ones when applying the usage TTL.
+    if File.exists?(path), do: _ = File.touch(path)
+    send_mirror_file(conn, path, "application/octet-stream")
   end
 
   defp send_mirror_file(conn, path, content_type) do

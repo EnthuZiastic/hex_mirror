@@ -28,4 +28,8 @@ if config_env() == :prod do
   if keep = System.get_env("HEX_MIRROR_KEEP_VERSIONS") do
     config :hex_mirror, keep_versions: String.to_integer(keep)
   end
+
+  if ttl_days = System.get_env("HEX_MIRROR_UNUSED_TTL_DAYS") do
+    config :hex_mirror, unused_ttl_seconds: String.to_integer(ttl_days) * 24 * 60 * 60
+  end
 end
