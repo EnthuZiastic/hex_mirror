@@ -36,6 +36,19 @@ config :hex_mirror, tarball_path: "/some/big/disk/hex"
 
 In production set `HEX_MIRROR_TARBALL_PATH` (see `config/runtime.exs`).
 
+### Retention env vars (prod)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `HEX_MIRROR_TARBALL_PATH` | `./tarballs` | Root dir for the on-disk store. |
+| `HEX_MIRROR_MAX_BYTES` | `5368709120` (5 GiB) | Hard cap on total tarball size. After every successful sweep, oldest-mtime tarballs are evicted until the total fits under this. |
+| `HEX_MIRROR_KEEP_VERSIONS` | `1` | Newest N semver releases retained per package, **and** the cap on how many versions a sweep will download. Setting `0` or negative is treated as unlimited. |
+| `HEX_MIRROR_UNUSED_TTL_DAYS` | `7` | Tarballs untouched (neither freshly fetched nor served) for this many days are evicted, except the single newest semver per package which is always retained as a floor. Set `0` to disable the TTL pass entirely. |
+
+The full retention policy lives in `HexMirror.Mirror.cleanup/1` and runs after
+every successful sweep. Failed sweeps (upstream unreachable / decode error)
+skip cleanup so an outage cannot evict the keep-set.
+
 ## Pointing `mix` at this mirror
 
 ```sh
