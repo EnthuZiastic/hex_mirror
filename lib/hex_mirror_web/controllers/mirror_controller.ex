@@ -22,6 +22,8 @@ defmodule HexMirrorWeb.MirrorController do
     send_mirror_file(conn, HexMirror.package_path(name), "application/octet-stream")
   end
 
+  @hex_pm_tarballs "https://repo.hex.pm/tarballs"
+
   def tarball(conn, %{"tarball" => tarball}) do
     path = HexMirror.tarball_file_path(tarball)
     # Bump mtime on serve so HexMirror.Mirror.cleanup/1 can distinguish
@@ -29,8 +31,16 @@ defmodule HexMirrorWeb.MirrorController do
     # The `File.exists?` guard is required: `File.touch/1` creates the file
     # if missing, which would turn 404s into empty 200s and let an attacker
     # planting bogus path params seed empty tarballs into the store.
-    if File.exists?(path), do: _ = File.touch(path)
-    send_mirror_file(conn, path, "application/octet-stream")
+    if File.exists?(path) do
+      _ = File.touch(path)
+      send_mirror_file(conn, path, "application/octet-stream")
+    else
+      # Cache miss: redirect to hex.pm. The caller (mix) follows the 302 and
+      # fetches directly. This makes the mirror fail-open: cache hits stay in
+      # the VPC (no NAT cost), misses fall back transparently. The next sweep
+      # will cache the version if it's within sweep_versions of the latest.
+      redirect(conn, external: "#{@hex_pm_tarballs}/#{tarball}")
+    end
   end
 
   defp send_mirror_file(conn, path, content_type) do

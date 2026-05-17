@@ -25,9 +25,9 @@ defmodule HexMirrorWeb.MirrorControllerTest do
     assert response(conn, 200) == "tarball-bytes"
   end
 
-  test "GET /tarballs/:tarball returns 404 when missing", %{conn: conn} do
+  test "GET /tarballs/:tarball redirects to hex.pm when missing", %{conn: conn} do
     conn = get(conn, ~p"/tarballs/missing-9.9.9.tar")
-    assert response(conn, 404) == "not found"
+    assert redirected_to(conn, 302) == "https://repo.hex.pm/tarballs/missing-9.9.9.tar"
   end
 
   test "GET /packages/:name serves the file", %{conn: conn, root: root} do

@@ -26,17 +26,28 @@ defmodule HexMirror do
   def tarball_file_path(filename), do: Path.join(tarballs_dir(), filename)
 
   @default_max_bytes 5 * 1024 * 1024 * 1024
-  @default_keep_versions 1
+  @default_keep_versions 0
+  @default_sweep_versions 2
   @default_unused_ttl_seconds 7 * 24 * 60 * 60
 
   @doc "Hard cap on total tarball size after each sweep. Override via `HEX_MIRROR_MAX_BYTES`."
   def max_bytes, do: Application.get_env(:hex_mirror, :max_bytes, @default_max_bytes)
 
   @doc """
-  Versions retained per package after cleanup AND the cap on how many newest
-  versions a sweep will download. Override via `HEX_MIRROR_KEEP_VERSIONS`.
+  Max versions per package retained by the version-count prune pass in cleanup.
+  `0` (default) disables version-count pruning entirely — retention is governed
+  solely by `unused_ttl_seconds` and `max_bytes`. Override via `HEX_MIRROR_KEEP_VERSIONS`.
   """
   def keep_versions, do: Application.get_env(:hex_mirror, :keep_versions, @default_keep_versions)
+
+  @doc """
+  Max versions per package downloaded per sweep. Decoupled from `keep_versions`
+  so the sweep stays bandwidth-bounded even when version-count pruning is disabled.
+  `0` means unlimited (download all historical versions — use with caution).
+  Override via `HEX_MIRROR_SWEEP_VERSIONS`.
+  """
+  def sweep_versions,
+    do: Application.get_env(:hex_mirror, :sweep_versions, @default_sweep_versions)
 
   @doc """
   Tarballs untouched (neither freshly fetched nor served) for longer than this
