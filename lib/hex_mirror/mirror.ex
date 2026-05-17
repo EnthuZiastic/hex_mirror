@@ -360,9 +360,11 @@ defmodule HexMirror.Mirror do
     end
   end
 
-  defp select_newest_versions(versions, keep) when keep <= 0, do: versions
+  @doc false
+  def select_newest_versions(versions, keep) when keep <= 0, do: versions
 
-  defp select_newest_versions(versions, keep) do
+  @doc false
+  def select_newest_versions(versions, keep) do
     versions
     |> Enum.flat_map(fn v ->
       case Version.parse(to_string(v)) do
