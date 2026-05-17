@@ -28,6 +28,39 @@ defmodule HexMirror.MirrorTest do
     path
   end
 
+  describe "select_newest_versions/2" do
+    test "keep <= 0 is sentinel pass-through — returns all versions unchanged" do
+      versions = ["1.0.0", "2.0.0", "1.5.0"]
+      assert Mirror.select_newest_versions(versions, 0) == versions
+      assert Mirror.select_newest_versions(versions, -1) == versions
+    end
+
+    test "returns newest N versions in descending semver order" do
+      versions = ["1.0.0", "2.0.0", "1.5.0"]
+      assert Mirror.select_newest_versions(versions, 2) == ["2.0.0", "1.5.0"]
+    end
+
+    test "returns all when keep >= length" do
+      versions = ["1.0.0", "2.0.0"]
+      assert Mirror.select_newest_versions(versions, 5) == ["2.0.0", "1.0.0"]
+    end
+
+    test "skips unparseable versions silently" do
+      versions = ["1.0.0", "not-a-version", "2.0.0"]
+      assert Mirror.select_newest_versions(versions, 2) == ["2.0.0", "1.0.0"]
+    end
+
+    test "handles pre-release semver ordering correctly" do
+      # semver: 1.0.0 > 1.0.0-rc.1 > 0.9.0
+      versions = ["1.0.0-rc.1", "1.0.0", "0.9.0"]
+      assert Mirror.select_newest_versions(versions, 2) == ["1.0.0", "1.0.0-rc.1"]
+    end
+
+    test "empty input returns empty list" do
+      assert Mirror.select_newest_versions([], 3) == []
+    end
+  end
+
   describe "cleanup/1 keep_versions" do
     test "keeps newest N semver, drops the rest" do
       now = :os.system_time(:second)
