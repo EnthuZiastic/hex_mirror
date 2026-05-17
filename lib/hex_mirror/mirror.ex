@@ -348,12 +348,11 @@ defmodule HexMirror.Mirror do
   defp download_versions(body, name, public_key) do
     case decode_package(body, name, public_key) do
       {:ok, versions} ->
-        # Fetch only the newest `keep_versions` releases per package. Without
-        # this cap, every fresh `/packages/<name>` (200) re-enumerated every
-        # historical version and `cleanup/1` would delete all but the newest
-        # straight after — burning bandwidth on an infinite refetch loop.
+        # Download only the newest `sweep_versions` releases per sweep.
+        # Decoupled from `keep_versions` so bandwidth stays bounded even when
+        # version-count pruning is disabled (keep_versions=0 / TTL-only mode).
         versions
-        |> select_newest_versions(HexMirror.keep_versions())
+        |> select_newest_versions(HexMirror.sweep_versions())
         |> Enum.each(fn version -> fetch_tarball(name, version) end)
 
       {:error, reason} ->
