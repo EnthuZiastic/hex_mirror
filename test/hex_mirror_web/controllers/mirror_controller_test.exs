@@ -30,6 +30,11 @@ defmodule HexMirrorWeb.MirrorControllerTest do
     assert redirected_to(conn, 302) == "https://repo.hex.pm/tarballs/missing-9.9.9.tar"
   end
 
+  test "GET /tarballs/:tarball returns 404 for malformed tarball name", %{conn: conn} do
+    conn = get(conn, ~p"/tarballs/INVALID.tar")
+    assert response(conn, 404)
+  end
+
   test "GET /packages/:name serves the file", %{conn: conn, root: root} do
     File.write!(Path.join([root, "packages", "foo"]), "signed-package-payload")
     conn = get(conn, ~p"/packages/foo")
