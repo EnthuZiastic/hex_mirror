@@ -10,15 +10,16 @@ defmodule HexMirror.MirrorWorker do
 
   require Logger
 
-  @default_interval :timer.minutes(1)
-
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   @impl GenServer
   def init(opts) do
-    interval = Keyword.get(opts, :interval, @default_interval)
+    # Default interval is config-driven (HEX_MIRROR_SWEEP_INTERVAL_MINUTES) so the
+    # sweep cadence — the dominant lever on filesystem IO cost — is tunable per
+    # environment without a code change. `opts[:interval]` still overrides for tests.
+    interval = Keyword.get(opts, :interval, HexMirror.sweep_interval_ms())
     schedule_work(interval)
     {:ok, %{interval: interval}}
   end
