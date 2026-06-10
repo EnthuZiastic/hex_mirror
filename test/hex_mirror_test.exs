@@ -1,11 +1,6 @@
 defmodule HexMirrorTest do
   use ExUnit.Case, async: false
 
-  # Config accessors that gate the sweep cadence (filesystem IO cost) and the
-  # eager-mirror-vs-lazy-cache behavior. Defaults must preserve historical
-  # behavior (1-minute sweep, full eager mirror) so existing deployments are
-  # unaffected; environments opt into throttling/laziness via env vars.
-
   describe "sweep_interval_ms/0" do
     setup do
       prev = Application.get_env(:hex_mirror, :sweep_interval_ms)
