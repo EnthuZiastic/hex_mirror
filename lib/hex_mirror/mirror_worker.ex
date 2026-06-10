@@ -16,9 +16,7 @@ defmodule HexMirror.MirrorWorker do
 
   @impl GenServer
   def init(opts) do
-    # Default interval is config-driven (HEX_MIRROR_SWEEP_INTERVAL_MINUTES) so the
-    # sweep cadence — the dominant lever on filesystem IO cost — is tunable per
-    # environment without a code change. `opts[:interval]` still overrides for tests.
+    # Config-driven default (see HexMirror.sweep_interval_ms/0); opts[:interval] overrides for tests.
     interval = Keyword.get(opts, :interval, HexMirror.sweep_interval_ms())
     schedule_work(interval)
     {:ok, %{interval: interval}}
