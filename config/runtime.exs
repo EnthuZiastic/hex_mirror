@@ -36,4 +36,12 @@ if config_env() == :prod do
   if ttl_days = System.get_env("HEX_MIRROR_UNUSED_TTL_DAYS") do
     config :hex_mirror, unused_ttl_seconds: String.to_integer(ttl_days) * 24 * 60 * 60
   end
+
+  if interval_min = System.get_env("HEX_MIRROR_SWEEP_INTERVAL_MINUTES") do
+    config :hex_mirror, sweep_interval_ms: String.to_integer(interval_min) * 60 * 1000
+  end
+
+  if prefetch = System.get_env("HEX_MIRROR_PREFETCH_TARBALLS") do
+    config :hex_mirror, prefetch_tarballs: prefetch in ~w(true 1 yes)
+  end
 end

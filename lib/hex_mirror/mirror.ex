@@ -346,17 +346,27 @@ defmodule HexMirror.Mirror do
   end
 
   defp download_versions(body, name, public_key) do
-    case decode_package(body, name, public_key) do
-      {:ok, versions} ->
-        # Download only the newest `sweep_versions` releases per sweep.
-        # Decoupled from `keep_versions` so bandwidth stays bounded even when
-        # version-count pruning is disabled (keep_versions=0 / TTL-only mode).
-        versions
-        |> select_newest_versions(HexMirror.sweep_versions())
-        |> Enum.each(fn version -> fetch_tarball(name, version) end)
+    # The caller (`fetch_package/2`) has already persisted the refreshed
+    # `/packages/<name>` registry index before reaching here, so resolution
+    # stays current regardless of prefetch mode. In lazy mode we skip the
+    # tarball downloads entirely — misses are served on demand by the
+    # controller (redirect to hex.pm), so eagerly mirroring every package's
+    # tarballs is pure waste (bandwidth + filesystem metadata churn).
+    if HexMirror.prefetch_tarballs?() do
+      case decode_package(body, name, public_key) do
+        {:ok, versions} ->
+          # Download only the newest `sweep_versions` releases per sweep.
+          # Decoupled from `keep_versions` so bandwidth stays bounded even when
+          # version-count pruning is disabled (keep_versions=0 / TTL-only mode).
+          versions
+          |> select_newest_versions(HexMirror.sweep_versions())
+          |> Enum.each(fn version -> fetch_tarball(name, version) end)
 
-      {:error, reason} ->
-        Logger.warning("decode package #{name} failed: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.warning("decode package #{name} failed: #{inspect(reason)}")
+      end
+    else
+      :registry_only
     end
   end
 
