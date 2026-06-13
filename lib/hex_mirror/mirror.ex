@@ -26,10 +26,10 @@ defmodule HexMirror.Mirror do
 
     result =
       with {:ok, public_key, _} <- fetch_public_key(),
-           {:ok, names_body, _} <- get_and_save("/names", HexMirror.names_path()),
-           {:ok, _versions_body, versions_freshness} <-
+           {:ok, _names_body, _} <- get_and_save("/names", HexMirror.names_path()),
+           {:ok, versions_body, versions_freshness} <-
              get_and_save("/versions", HexMirror.versions_path()) do
-        handle_versions(versions_freshness, names_body, public_key)
+        handle_versions(versions_freshness, versions_body, public_key)
       else
         {:error, reason} ->
           Logger.error("mirror sweep aborted: #{inspect(reason)}")
@@ -217,7 +217,7 @@ defmodule HexMirror.Mirror do
     end
   end
 
-  defp handle_versions(:not_modified, _names_body, _public_key) do
+  defp handle_versions(:not_modified, _versions_body, _public_key) do
     Logger.debug("/versions unchanged, skipping per-package sweep")
     # Refresh mtimes of every on-disk tarball whose mtime is already past the
     # half-window threshold, so the usage TTL pass treats a quiet upstream
@@ -229,15 +229,62 @@ defmodule HexMirror.Mirror do
     :ok
   end
 
-  defp handle_versions(:fresh, names_body, public_key) do
-    case decode_names(names_body, public_key) do
-      {:ok, package_names} ->
-        Enum.each(package_names, &fetch_package(&1, public_key))
+  # `/versions` changed since the last sweep. Rather than re-checking all ~16k
+  # packages (one conditional GET each), decode the new `/versions`, diff it
+  # against the persisted baseline, and only re-fetch `/packages/<name>` for the
+  # packages whose version set actually moved (added ∪ bumped ∪ retirement
+  # change). This keeps sweep freshness identical (the changed package's
+  # registry index is refreshed the same sweep its publish lands in `/versions`)
+  # while cutting a fresh sweep from ~16k requests to ~tens.
+  #
+  # The baseline is a SEPARATE sidecar — never the served `/versions` file,
+  # which `conditional_get` already advanced (clients want it fresh). We advance
+  # the baseline only after every changed-set fetch succeeds, so a transient
+  # per-package failure leaves the baseline put and the straggler is retried on
+  # the next sweep (matching today's self-healing). A missing/unreadable
+  # baseline (cold start) makes the whole universe "changed" ⇒ full sweep.
+  defp handle_versions(:fresh, versions_body, public_key) do
+    case decode_versions_payload(versions_body, public_key) do
+      {:ok, packages} ->
+        new_map = versions_map(packages)
+        baseline = read_versions_baseline()
+        changed = changed_packages(baseline, new_map)
+
+        Logger.info(
+          "/versions changed: refreshing #{length(changed)} of #{map_size(new_map)} package(s)"
+        )
+
+        results = Enum.map(changed, &fetch_package(&1, public_key))
+        maybe_advance_baseline(results, new_map)
+
+        # The pre-diff sweep walked every package and `File.touch`ed each
+        # existing tarball, keeping the usage-TTL keep-set live. Diffing skips
+        # unchanged packages, so refresh stale tarball mtimes explicitly here
+        # (same call the `:not_modified` path uses). No-op in lazy mode, where
+        # tarballs are never mirrored and `unused_ttl_seconds <= 0` short-circuits.
+        refresh_stale_tarball_mtimes()
         :ok
 
       {:error, reason} ->
         Logger.error("mirror sweep aborted: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  # Advance the diff baseline only when no package fetch failed. `fetch_package/2`
+  # returns `:skip` on a transport/status error; any other return (`:unchanged`,
+  # the `download_versions/3` result) is a success. Holding the baseline on
+  # failure means the failed package stays in the next sweep's changed set and
+  # gets retried — without re-walking all 16k packages.
+  defp maybe_advance_baseline(results, new_map) do
+    case Enum.count(results, &(&1 == :skip)) do
+      0 ->
+        write_versions_baseline(new_map)
+
+      failed ->
+        Logger.warning(
+          "#{failed} package fetch(es) failed; holding /versions baseline (retry next sweep)"
+        )
     end
   end
 
@@ -313,20 +360,63 @@ defmodule HexMirror.Mirror do
     end
   end
 
-  defp decode_names(body, public_key) do
+  defp decode_versions_payload(body, public_key) do
     case :hex_registry.decode_and_verify_signed(maybe_gunzip(body), public_key) do
       {:ok, payload} ->
-        case :hex_registry.decode_names(payload, @repository) do
+        case :hex_registry.decode_versions(payload, @repository) do
           {:ok, %{packages: packages}} ->
-            {:ok, Enum.map(packages, & &1.name)}
+            {:ok, packages}
 
           err ->
-            {:error, {:decode_names, err}}
+            {:error, {:decode_versions, err}}
         end
 
       err ->
-        {:error, {:verify_names, err}}
+        {:error, {:verify_versions, err}}
     end
+  end
+
+  # Collapse the decoded `/versions` packages into a `%{name => {versions,
+  # retired}}` map — the per-package fingerprint the diff compares. `retired` is
+  # included because a retirement flips `/versions` to `:fresh` without changing
+  # the version list; diffing on versions alone would skip refreshing that
+  # package's retirement metadata (`/packages/<name>`, served local-only).
+  defp versions_map(packages) do
+    Map.new(packages, fn pkg ->
+      {pkg.name, {pkg.versions, Map.get(pkg, :retired, [])}}
+    end)
+  end
+
+  @doc """
+  Packages whose version/retirement fingerprint differs between the baseline and
+  the freshly-decoded `/versions` map. A `nil` baseline (cold start / unreadable
+  sidecar) returns every package, reproducing a full sweep. Removed packages are
+  intentionally excluded — there is nothing to re-fetch, and `cleanup/1` reclaims
+  their tarballs.
+  """
+  @spec changed_packages(map() | nil, map()) :: [String.t()]
+  def changed_packages(nil, new_map), do: Map.keys(new_map)
+
+  def changed_packages(old_map, new_map) when is_map(old_map) do
+    for {name, fingerprint} <- new_map, Map.get(old_map, name) != fingerprint, do: name
+  end
+
+  defp versions_baseline_path, do: HexMirror.versions_path() <> ".baseline"
+
+  defp read_versions_baseline do
+    with {:ok, bin} <- File.read(versions_baseline_path()),
+         %{} = map <- safe_term(bin),
+         true <- map_size(map) > 0 do
+      map
+    else
+      _ -> nil
+    end
+  end
+
+  defp write_versions_baseline(new_map) do
+    File.write!(versions_baseline_path(), :erlang.term_to_binary(new_map))
+  rescue
+    err -> Logger.warning("failed to persist /versions baseline: #{inspect(err)}")
   end
 
   # hex.pm serves signed registry payloads gzipped. We persist the gzipped bytes

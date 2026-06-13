@@ -61,6 +61,47 @@ defmodule HexMirror.MirrorTest do
     end
   end
 
+  describe "changed_packages/2" do
+    test "nil baseline (cold start) returns every package" do
+      new_map = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0"], []}}
+      assert Enum.sort(Mirror.changed_packages(nil, new_map)) == ["bar", "foo"]
+    end
+
+    test "added package is included" do
+      old = %{"foo" => {["1.0.0"], []}}
+      new = %{"foo" => {["1.0.0"], []}, "bar" => {["0.1.0"], []}}
+      assert Mirror.changed_packages(old, new) == ["bar"]
+    end
+
+    test "bumped version is included" do
+      old = %{"foo" => {["1.0.0"], []}}
+      new = %{"foo" => {["1.0.0", "1.1.0"], []}}
+      assert Mirror.changed_packages(old, new) == ["foo"]
+    end
+
+    test "retirement-only change is included" do
+      old = %{"foo" => {["1.0.0"], []}}
+      new = %{"foo" => {["1.0.0"], [0]}}
+      assert Mirror.changed_packages(old, new) == ["foo"]
+    end
+
+    test "unchanged package is excluded" do
+      old = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0"], []}}
+      new = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0"], []}}
+      assert Mirror.changed_packages(old, new) == []
+    end
+
+    test "removed package is excluded (nothing to fetch)" do
+      old = %{"foo" => {["1.0.0"], []}, "gone" => {["9.0.0"], []}}
+      new = %{"foo" => {["1.0.0"], []}}
+      assert Mirror.changed_packages(old, new) == []
+    end
+
+    test "empty new map returns empty" do
+      assert Mirror.changed_packages(%{"foo" => {["1.0.0"], []}}, %{}) == []
+    end
+  end
+
   describe "cleanup/1 keep_versions" do
     test "keeps newest N semver, drops the rest" do
       now = :os.system_time(:second)
