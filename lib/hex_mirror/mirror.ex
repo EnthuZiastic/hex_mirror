@@ -285,7 +285,7 @@ defmodule HexMirror.Mirror do
             {:ok, _name} -> []
           end)
 
-        advance_baseline(new_map, failed)
+        advance_baseline(new_map, failed, baseline)
 
         # The pre-diff sweep walked every package and `File.touch`ed each
         # existing tarball, keeping the usage-TTL keep-set live. Diffing skips
@@ -313,14 +313,22 @@ defmodule HexMirror.Mirror do
   package failed (nothing succeeded), the existing baseline is left untouched so
   the next sweep re-diffs / cold-starts against it rather than persisting an
   empty map (which `read_versions_baseline/0` would reject ⇒ forced full walk).
+
+  `prior` is the baseline already read by the caller this sweep, passed in to
+  avoid a second decode of the ~16k-entry sidecar. The `/2` form re-reads it for
+  callers (tests) that do not already hold it.
   """
   @spec advance_baseline(map(), [String.t()]) :: :ok
-  def advance_baseline(new_map, _failed) when map_size(new_map) == 0 do
+  def advance_baseline(new_map, failed),
+    do: advance_baseline(new_map, failed, read_versions_baseline())
+
+  @spec advance_baseline(map(), [String.t()], map() | nil) :: :ok
+  def advance_baseline(new_map, _failed, _prior) when map_size(new_map) == 0 do
     Logger.warning("/versions decoded to 0 packages; holding existing baseline")
     :ok
   end
 
-  def advance_baseline(new_map, failed) do
+  def advance_baseline(new_map, failed, prior) do
     baseline_next = Map.drop(new_map, failed)
 
     cond do
@@ -331,10 +339,13 @@ defmodule HexMirror.Mirror do
         # persist an empty map (which `read_versions_baseline/0` rejects).
         Logger.warning("no packages fetched successfully this sweep; holding existing baseline")
 
-      baseline_next == read_versions_baseline() ->
+      failed == [] and baseline_next == prior ->
         # `:fresh` `/versions` (e.g. an upstream re-sign) but the decoded
-        # fingerprints are byte-identical to what we already persisted, and no
-        # packages failed — skip the no-op rewrite.
+        # fingerprints are byte-identical to what we already persisted AND no
+        # package failed — skip the no-op rewrite. The `failed == []` guard is
+        # essential: without it, a newly-published package that fails to fetch
+        # can leave `baseline_next` coincidentally equal to `prior`, and the
+        # partial-baseline warning below would be silently swallowed.
         :ok
 
       failed == [] ->
