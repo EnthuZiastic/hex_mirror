@@ -165,6 +165,23 @@ defmodule HexMirror.MirrorTest do
       assert Mirror.advance_baseline(%{}, []) == :ok
       assert Mirror.read_versions_baseline() == prior
     end
+
+    test "byte-identical baseline is not rewritten (no-op short-circuit)" do
+      same = %{"foo" => {["1.0.0"], []}}
+      path = Mirror.versions_baseline_path()
+      Mirror.write_versions_baseline(same)
+
+      # Stamp an old mtime; a real rewrite would bump it to ~now.
+      old = :os.system_time(:second) - 10_000
+      stat = File.stat!(path, time: :posix)
+      :ok = File.write_stat(path, %{stat | mtime: old}, time: :posix)
+
+      # advance with the identical map + no failures → should skip the write.
+      assert Mirror.advance_baseline(same, []) == :ok
+
+      assert File.stat!(path, time: :posix).mtime == old
+      assert Mirror.read_versions_baseline() == same
+    end
   end
 
   describe "cleanup/1 keep_versions" do

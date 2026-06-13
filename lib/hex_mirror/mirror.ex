@@ -325,9 +325,17 @@ defmodule HexMirror.Mirror do
 
     cond do
       map_size(baseline_next) == 0 ->
-        Logger.warning(
-          "no packages fetched successfully this sweep; holding existing baseline (retry next sweep)"
-        )
+        # Nothing succeeded. Hold the existing baseline: if it was a real
+        # baseline the next `:fresh` sweep re-diffs against it; if it was a cold
+        # start (`nil`) the next sweep is another full walk. Either way we never
+        # persist an empty map (which `read_versions_baseline/0` rejects).
+        Logger.warning("no packages fetched successfully this sweep; holding existing baseline")
+
+      baseline_next == read_versions_baseline() ->
+        # `:fresh` `/versions` (e.g. an upstream re-sign) but the decoded
+        # fingerprints are byte-identical to what we already persisted, and no
+        # packages failed — skip the no-op rewrite.
+        :ok
 
       failed == [] ->
         write_versions_baseline(baseline_next)
@@ -335,7 +343,7 @@ defmodule HexMirror.Mirror do
       true ->
         Logger.warning(
           "#{length(failed)} package fetch(es) failed; persisting partial baseline " <>
-            "(failed packages retried next sweep)"
+            "(failed packages re-diffed on the next :fresh sweep)"
         )
 
         write_versions_baseline(baseline_next)
@@ -568,17 +576,15 @@ defmodule HexMirror.Mirror do
             |> Enum.map(fn version -> fetch_tarball(name, version) end)
             |> Enum.filter(&match?({:error, _}, &1))
 
+          # Per-tarball failures are already logged by `fetch_tarball/2`, and
+          # the package-level summary is logged once by `fetch_package/2` when it
+          # invalidates the cache — so just return the tagged result here.
           case failures do
-            [] ->
-              {:ok, :prefetched}
-
-            _ ->
-              Logger.warning("package #{name}: #{length(failures)} tarball download(s) failed")
-              {:error, {:tarball, name, length(failures)}}
+            [] -> {:ok, :prefetched}
+            _ -> {:error, {:tarball, name, length(failures)}}
           end
 
         {:error, reason} ->
-          Logger.warning("decode package #{name} failed: #{inspect(reason)}")
           {:error, {:decode_package, reason}}
       end
     else
