@@ -104,6 +104,25 @@ defmodule HexMirror.MirrorTest do
     end
   end
 
+  describe "versions_map/1 fingerprint" do
+    test "is order-insensitive — upstream list reorder produces no diff" do
+      packages_a = [%{name: "foo", versions: ["1.0.0", "1.1.0"], retired: [0, 1]}]
+      packages_b = [%{name: "foo", versions: ["1.1.0", "1.0.0"], retired: [1, 0]}]
+
+      assert Mirror.versions_map(packages_a) == Mirror.versions_map(packages_b)
+
+      assert Mirror.changed_packages(
+               Mirror.versions_map(packages_a),
+               Mirror.versions_map(packages_b)
+             ) == []
+    end
+
+    test "defaults missing :retired to []" do
+      assert Mirror.versions_map([%{name: "foo", versions: ["1.0.0"]}]) ==
+               %{"foo" => {["1.0.0"], []}}
+    end
+  end
+
   describe "versions baseline read/write roundtrip" do
     test "write then read returns the same map" do
       map = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0", "2.1.0"], [0]}}

@@ -456,9 +456,15 @@ defmodule HexMirror.Mirror do
   # included because a retirement flips `/versions` to `:fresh` without changing
   # the version list; diffing on versions alone would skip refreshing that
   # package's retirement metadata (`/packages/<name>`, served local-only).
-  defp versions_map(packages) do
+  #
+  # Both lists are sorted so the fingerprint is order-insensitive: the diff uses
+  # `==`, and if hex.pm ever re-emitted a package's versions in a different order
+  # (a rebuild / serialization change we don't control) an unsorted fingerprint
+  # would mark every package "changed" ⇒ one full ~16k sweep until rebaselined.
+  @doc false
+  def versions_map(packages) do
     Map.new(packages, fn pkg ->
-      {pkg.name, {pkg.versions, Map.get(pkg, :retired, [])}}
+      {pkg.name, {Enum.sort(pkg.versions), Enum.sort(Map.get(pkg, :retired, []))}}
     end)
   end
 
