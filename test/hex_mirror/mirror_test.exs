@@ -1,6 +1,8 @@
 defmodule HexMirror.MirrorTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias HexMirror.Mirror
 
   setup do
@@ -163,6 +165,24 @@ defmodule HexMirror.MirrorTest do
       Mirror.write_versions_baseline(prior)
 
       assert Mirror.advance_baseline(%{}, []) == :ok
+      assert Mirror.read_versions_baseline() == prior
+    end
+
+    test "added package failing still logs the partial-baseline warning (no-op guard requires failed == [])" do
+      prior = %{"foo" => {["1.0.0"], []}}
+      Mirror.write_versions_baseline(prior)
+
+      # `bar` newly published upstream but its fetch failed → baseline_next
+      # coincidentally equals `prior`, but the failure must still be logged.
+      new_map = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0"], []}}
+
+      log =
+        capture_log(fn ->
+          assert Mirror.advance_baseline(new_map, ["bar"]) == :ok
+        end)
+
+      assert log =~ "partial baseline"
+      # baseline still excludes the failed package so it re-diffs next sweep.
       assert Mirror.read_versions_baseline() == prior
     end
 
