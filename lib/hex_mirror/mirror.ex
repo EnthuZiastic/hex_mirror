@@ -9,6 +9,13 @@ defmodule HexMirror.Mirror do
   reuses the on-disk body and skips downstream work; a 200 rewrites the body
   and the sidecar `.meta` (etag + last-modified) used on the next sweep.
   Tarballs are immutable per name+version, so existence on disk is enough.
+
+  When `/versions` itself changes, the per-package sweep is scoped by *diffing*
+  the new `/versions` against a persisted fingerprint baseline
+  (`versions.baseline` sidecar) — only changed packages are re-fetched. The diff
+  trusts the baseline as ground truth and does not reconcile on-disk reality, so
+  a manually deleted `/packages/<name>` file is not re-fetched until that
+  package's fingerprint moves upstream. See `handle_versions/3`.
   """
 
   require Logger
@@ -38,6 +45,11 @@ defmodule HexMirror.Mirror do
 
     case result do
       :ok ->
+        # Ordering: `handle_versions/3` already ran `refresh_stale_tarball_mtimes/0`
+        # (both the `:fresh` and `:not_modified` paths bump live tarballs past the
+        # half-TTL threshold) BEFORE this `cleanup/1`. So `evict_unused/3`'s
+        # `:os.system_time(:second)` cutoff sees the refreshed mtimes and keeps
+        # the live keep-set. Do not reorder cleanup ahead of the sweep.
         cleanup()
 
       {:error, _} ->
@@ -238,11 +250,22 @@ defmodule HexMirror.Mirror do
   # while cutting a fresh sweep from ~16k requests to ~tens.
   #
   # The baseline is a SEPARATE sidecar — never the served `/versions` file,
-  # which `conditional_get` already advanced (clients want it fresh). We advance
-  # the baseline only after every changed-set fetch succeeds, so a transient
-  # per-package failure leaves the baseline put and the straggler is retried on
-  # the next sweep (matching today's self-healing). A missing/unreadable
-  # baseline (cold start) makes the whole universe "changed" ⇒ full sweep.
+  # which `conditional_get` already advanced (clients want it fresh). We persist
+  # a PARTIAL baseline: the new fingerprint for every package whose fetch
+  # succeeded, with the *failed* packages dropped. A dropped package reappears as
+  # "added" on the next diff and is retried — so a transient per-package failure
+  # self-heals to a tiny straggler set instead of forcing another full walk (the
+  # critical property on cold start, where the changed set is the whole ~16k
+  # universe). "Next diff" means the next sweep on which `/versions` is itself
+  # `:fresh` — the `:not_modified` path does not re-diff. hex.pm publishes
+  # globally every few minutes so the retry window is short in practice. A
+  # missing/unreadable baseline (cold start) makes the whole universe "changed"
+  # ⇒ full sweep.
+  #
+  # The diff trusts the baseline as ground truth: it compares fingerprints, not
+  # on-disk reality. A manually deleted / partially-restored `/packages/<name>`
+  # file is NOT re-reconciled until that package's fingerprint moves upstream.
+  # Operational filesystem repair is out of scope for the normal sweep path.
   defp handle_versions(:fresh, versions_body, public_key) do
     case decode_versions_payload(versions_body, public_key) do
       {:ok, packages} ->
@@ -254,8 +277,15 @@ defmodule HexMirror.Mirror do
           "/versions changed: refreshing #{length(changed)} of #{map_size(new_map)} package(s)"
         )
 
-        results = Enum.map(changed, &fetch_package(&1, public_key))
-        maybe_advance_baseline(results, new_map)
+        failed =
+          changed
+          |> Enum.map(&fetch_package(&1, public_key))
+          |> Enum.flat_map(fn
+            {:error, name} -> [name]
+            {:ok, _name} -> []
+          end)
+
+        advance_baseline(new_map, failed)
 
         # The pre-diff sweep walked every package and `File.touch`ed each
         # existing tarball, keeping the usage-TTL keep-set live. Diffing skips
@@ -271,21 +301,47 @@ defmodule HexMirror.Mirror do
     end
   end
 
-  # Advance the diff baseline only when no package fetch failed. `fetch_package/2`
-  # returns `:skip` on a transport/status error; any other return (`:unchanged`,
-  # the `download_versions/3` result) is a success. Holding the baseline on
-  # failure means the failed package stays in the next sweep's changed set and
-  # gets retried — without re-walking all 16k packages.
-  defp maybe_advance_baseline(results, new_map) do
-    case Enum.count(results, &(&1 == :skip)) do
-      0 ->
-        write_versions_baseline(new_map)
+  @doc """
+  Persist the diff baseline after a fresh sweep. Writes `new_map` minus the
+  packages whose fetch failed, so a failed package keeps its old (or absent)
+  fingerprint and is re-attempted on the next `:fresh` sweep (the `:not_modified`
+  path does not re-diff) — bounding the retry set to the stragglers rather than
+  re-walking all ~16k packages.
 
-      failed ->
+  Two guards prevent a degenerate upstream payload from wiping a good baseline:
+  if `new_map` is empty (`/versions` decoded to zero packages) or every changed
+  package failed (nothing succeeded), the existing baseline is left untouched so
+  the next sweep re-diffs / cold-starts against it rather than persisting an
+  empty map (which `read_versions_baseline/0` would reject ⇒ forced full walk).
+  """
+  @spec advance_baseline(map(), [String.t()]) :: :ok
+  def advance_baseline(new_map, _failed) when map_size(new_map) == 0 do
+    Logger.warning("/versions decoded to 0 packages; holding existing baseline")
+    :ok
+  end
+
+  def advance_baseline(new_map, failed) do
+    baseline_next = Map.drop(new_map, failed)
+
+    cond do
+      map_size(baseline_next) == 0 ->
         Logger.warning(
-          "#{failed} package fetch(es) failed; holding /versions baseline (retry next sweep)"
+          "no packages fetched successfully this sweep; holding existing baseline (retry next sweep)"
         )
+
+      failed == [] ->
+        write_versions_baseline(baseline_next)
+
+      true ->
+        Logger.warning(
+          "#{length(failed)} package fetch(es) failed; persisting partial baseline " <>
+            "(failed packages retried next sweep)"
+        )
+
+        write_versions_baseline(baseline_next)
     end
+
+    :ok
   end
 
   # Walks every tarball on disk and bumps mtime *only* when it has aged past
@@ -401,9 +457,14 @@ defmodule HexMirror.Mirror do
     for {name, fingerprint} <- new_map, Map.get(old_map, name) != fingerprint, do: name
   end
 
-  defp versions_baseline_path, do: HexMirror.versions_path() <> ".baseline"
+  @doc false
+  def versions_baseline_path, do: HexMirror.versions_path() <> ".baseline"
 
-  defp read_versions_baseline do
+  # Returns the persisted fingerprint map, or `nil` when the sidecar is absent,
+  # unreadable, corrupt (`safe_term/1` ⇒ `%{}`), or empty — all of which the
+  # caller treats as cold start (full sweep). Public for tests.
+  @doc false
+  def read_versions_baseline do
     with {:ok, bin} <- File.read(versions_baseline_path()),
          %{} = map <- safe_term(bin),
          true <- map_size(map) > 0 do
@@ -413,7 +474,8 @@ defmodule HexMirror.Mirror do
     end
   end
 
-  defp write_versions_baseline(new_map) do
+  @doc false
+  def write_versions_baseline(new_map) do
     File.write!(versions_baseline_path(), :erlang.term_to_binary(new_map))
   rescue
     err -> Logger.warning("failed to persist /versions baseline: #{inspect(err)}")
@@ -425,13 +487,61 @@ defmodule HexMirror.Mirror do
   defp maybe_gunzip(<<31, 139, 8, _::binary>> = body), do: :zlib.gunzip(body)
   defp maybe_gunzip(body), do: body
 
+  # Returns `{:ok, name}` on a successful refresh (304 unchanged, or a fresh
+  # `/packages/<name>` that decoded cleanly) and `{:error, name}` on any failure
+  # — transport / non-200-304 status, OR a decode-and-verify failure of the
+  # fresh payload. Tagged rather than a bare `:skip` sentinel so the baseline
+  # advance counts *explicit successes* and a decode failure (signature
+  # mismatch, malformed payload) also holds the package for retry — not just a
+  # transport error. `advance_baseline/2` consumes the `{:error, name}` set.
   defp fetch_package(name, public_key) do
     save_path = HexMirror.package_path(name)
 
     case get_and_save("/packages/#{name}", save_path) do
-      {:ok, _body, :not_modified} -> :unchanged
-      {:ok, body, :fresh} -> download_versions(body, name, public_key)
-      _ -> :skip
+      {:ok, _body, :not_modified} ->
+        {:ok, name}
+
+      {:ok, body, :fresh} ->
+        case download_versions(body, name, public_key) do
+          {:ok, _} ->
+            {:ok, name}
+
+          {:error, reason} ->
+            # `conditional_get` already persisted the etag/last-modified `.meta`
+            # for this 200 BEFORE we got here, so the on-disk body is bad/partial
+            # but the cache validators are current. Left intact, the next sweep
+            # would send `If-None-Match`, get a 304, take the `:not_modified`
+            # success branch, and NEVER re-decode — masking this failure
+            # permanently and serving the bad body. Invalidate the cache so the
+            # retry forces a real GET (200) and re-attempts the decode.
+            Logger.error(
+              "package #{name} fresh-fetch failed (#{inspect(reason)}); " <>
+                "invalidating cache to force re-fetch next sweep"
+            )
+
+            invalidate_cache(save_path)
+            {:error, name}
+        end
+
+      _ ->
+        {:error, name}
+    end
+  end
+
+  # Drop the `.meta` sidecar so the next `conditional_get` sends no
+  # `If-None-Match` / `If-Modified-Since` and upstream must answer 200 (not 304).
+  # The body file is left in place so the mirror keeps serving the prior bytes
+  # until the refetch lands, rather than 404ing in the gap.
+  defp invalidate_cache(save_path) do
+    case File.rm(meta_path(save_path)) do
+      :ok ->
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("cache invalidation for #{save_path} failed: #{inspect(reason)}")
     end
   end
 
@@ -448,15 +558,31 @@ defmodule HexMirror.Mirror do
           # Download only the newest `sweep_versions` releases per sweep.
           # Decoupled from `keep_versions` so bandwidth stays bounded even when
           # version-count pruning is disabled (keep_versions=0 / TTL-only mode).
-          versions
-          |> select_newest_versions(HexMirror.sweep_versions())
-          |> Enum.each(fn version -> fetch_tarball(name, version) end)
+          # Collect per-tarball results: if any download errored, fail the
+          # package so `fetch_package/2` returns `{:error, name}`, the cache is
+          # invalidated, and the baseline does NOT advance past a package with
+          # missing tarballs (it stays in the next sweep's changed set).
+          failures =
+            versions
+            |> select_newest_versions(HexMirror.sweep_versions())
+            |> Enum.map(fn version -> fetch_tarball(name, version) end)
+            |> Enum.filter(&match?({:error, _}, &1))
+
+          case failures do
+            [] ->
+              {:ok, :prefetched}
+
+            _ ->
+              Logger.warning("package #{name}: #{length(failures)} tarball download(s) failed")
+              {:error, {:tarball, name, length(failures)}}
+          end
 
         {:error, reason} ->
           Logger.warning("decode package #{name} failed: #{inspect(reason)}")
+          {:error, {:decode_package, reason}}
       end
     else
-      :registry_only
+      {:ok, :registry_only}
     end
   end
 

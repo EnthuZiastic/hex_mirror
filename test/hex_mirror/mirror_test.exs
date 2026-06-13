@@ -102,6 +102,71 @@ defmodule HexMirror.MirrorTest do
     end
   end
 
+  describe "versions baseline read/write roundtrip" do
+    test "write then read returns the same map" do
+      map = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0", "2.1.0"], [0]}}
+      assert Mirror.write_versions_baseline(map) == :ok
+      assert Mirror.read_versions_baseline() == map
+    end
+
+    test "absent sidecar reads as nil (cold start)" do
+      refute File.exists?(Mirror.versions_baseline_path())
+      assert Mirror.read_versions_baseline() == nil
+    end
+
+    test "empty binary reads as nil" do
+      File.write!(Mirror.versions_baseline_path(), <<>>)
+      assert Mirror.read_versions_baseline() == nil
+    end
+
+    test "garbage (non-term) binary reads as nil" do
+      File.write!(Mirror.versions_baseline_path(), "not-an-erlang-term")
+      assert Mirror.read_versions_baseline() == nil
+    end
+
+    test "persisted empty map reads as nil (rejected by map_size guard)" do
+      File.write!(Mirror.versions_baseline_path(), :erlang.term_to_binary(%{}))
+      assert Mirror.read_versions_baseline() == nil
+    end
+  end
+
+  describe "advance_baseline/2" do
+    test "no failures persists the full new map" do
+      new_map = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0"], []}}
+      assert Mirror.advance_baseline(new_map, []) == :ok
+      assert Mirror.read_versions_baseline() == new_map
+    end
+
+    test "partial failure drops failed packages so they re-diff next sweep" do
+      new_map = %{"foo" => {["1.0.0"], []}, "bar" => {["2.0.0"], []}}
+      assert Mirror.advance_baseline(new_map, ["bar"]) == :ok
+
+      baseline = Mirror.read_versions_baseline()
+      assert baseline == %{"foo" => {["1.0.0"], []}}
+      # `bar` is absent from the baseline → next diff sees it as "added".
+      assert "bar" in Mirror.changed_packages(baseline, new_map)
+      refute "foo" in Mirror.changed_packages(baseline, new_map)
+    end
+
+    test "all changed packages failing holds the existing baseline" do
+      prior = %{"foo" => {["0.9.0"], []}}
+      Mirror.write_versions_baseline(prior)
+
+      new_map = %{"foo" => {["1.0.0"], []}}
+      assert Mirror.advance_baseline(new_map, ["foo"]) == :ok
+      # baseline_next would be empty ⇒ not written; prior baseline preserved.
+      assert Mirror.read_versions_baseline() == prior
+    end
+
+    test "empty new map (degenerate payload) does not wipe the baseline" do
+      prior = %{"foo" => {["1.0.0"], []}}
+      Mirror.write_versions_baseline(prior)
+
+      assert Mirror.advance_baseline(%{}, []) == :ok
+      assert Mirror.read_versions_baseline() == prior
+    end
+  end
+
   describe "cleanup/1 keep_versions" do
     test "keeps newest N semver, drops the rest" do
       now = :os.system_time(:second)
