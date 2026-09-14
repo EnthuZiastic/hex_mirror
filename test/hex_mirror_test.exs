@@ -44,4 +44,26 @@ defmodule HexMirrorTest do
       assert HexMirror.prefetch_tarballs?() == false
     end
   end
+
+  describe "housekeeping_every_n_sweeps/0" do
+    setup do
+      prev = Application.get_env(:hex_mirror, :housekeeping_every_n_sweeps)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:hex_mirror, :housekeeping_every_n_sweeps),
+          else: Application.put_env(:hex_mirror, :housekeeping_every_n_sweeps, prev)
+      end)
+    end
+
+    test "defaults to 1 (housekeeping every sweep) when unset" do
+      Application.delete_env(:hex_mirror, :housekeeping_every_n_sweeps)
+      assert HexMirror.housekeeping_every_n_sweeps() == 1
+    end
+
+    test "reads the configured value" do
+      Application.put_env(:hex_mirror, :housekeeping_every_n_sweeps, 24)
+      assert HexMirror.housekeeping_every_n_sweeps() == 24
+    end
+  end
 end
