@@ -15,7 +15,7 @@ defmodule HexMirror.Mirror do
   (`versions.baseline` sidecar) — only changed packages are re-fetched. The diff
   trusts the baseline as ground truth and does not reconcile on-disk reality, so
   a manually deleted `/packages/<name>` file is not re-fetched until that
-  package's fingerprint moves upstream. See `handle_versions/3`.
+  package's fingerprint moves upstream. See `handle_versions/4`.
   """
 
   require Logger
@@ -94,11 +94,22 @@ defmodule HexMirror.Mirror do
 
   Errors are logged, not raised. Cleanup never aborts the sweep.
 
-  Note: `fetch/0` only invokes `cleanup/1` when the sweep itself succeeded.
-  A failed sweep (transport / decode error) skips cleanup entirely so an
-  upstream outage on a fresh pod cannot evict the keep-set, and a
-  misconfigured `max_bytes` cannot chew through the store while we are blind
-  to upstream state. Manual `cleanup/1` callers always run all three passes.
+  Note: `fetch/1` only invokes `cleanup/1` when the sweep itself succeeded
+  AND `housekeeping?` is true for this tick (see `fetch/1`,
+  `HexMirror.housekeeping_every_n_sweeps/0`). A failed sweep (transport /
+  decode error) skips cleanup entirely so an upstream outage on a fresh pod
+  cannot evict the keep-set, and a misconfigured `max_bytes` cannot chew
+  through the store while we are blind to upstream state. A `housekeeping?
+  false` tick skips it too — deliberately: **all three passes above,
+  including the `max_bytes` hard cap and `keep_versions` pruning, are
+  gated together**, not just the TTL pass. There is no way to run the cap
+  or the pruning pass more often than the TTL pass without paying the
+  underlying `list_tarball_entries/1` walk again for that pass alone,
+  which defeats the point of gating it in the first place — see
+  `HexMirror.housekeeping_every_n_sweeps/0` for the resulting latency
+  this introduces on `max_bytes` enforcement, and size prod's `max_bytes`
+  with that latency in mind. Manual `cleanup/1` callers always run all
+  three passes, regardless of `housekeeping?`.
   """
   def cleanup(opts \\ []) do
     max_bytes = Keyword.get(opts, :max_bytes, HexMirror.max_bytes())
