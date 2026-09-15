@@ -41,6 +41,11 @@ if config_env() == :prod do
     config :hex_mirror, sweep_interval_ms: String.to_integer(interval_min) * 60 * 1000
   end
 
+  if housekeeping_every = System.get_env("HEX_MIRROR_HOUSEKEEPING_EVERY_N_SWEEPS") do
+    config :hex_mirror,
+      housekeeping_every_n_sweeps: String.to_integer(housekeeping_every)
+  end
+
   if prefetch = System.get_env("HEX_MIRROR_PREFETCH_TARBALLS") do
     config :hex_mirror, prefetch_tarballs: prefetch in ~w(true 1 yes)
   end

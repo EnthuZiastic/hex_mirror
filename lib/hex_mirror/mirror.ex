@@ -15,7 +15,7 @@ defmodule HexMirror.Mirror do
   (`versions.baseline` sidecar) — only changed packages are re-fetched. The diff
   trusts the baseline as ground truth and does not reconcile on-disk reality, so
   a manually deleted `/packages/<name>` file is not re-fetched until that
-  package's fingerprint moves upstream. See `handle_versions/3`.
+  package's fingerprint moves upstream. See `handle_versions/4`.
   """
 
   require Logger
@@ -27,8 +27,23 @@ defmodule HexMirror.Mirror do
   Single sweep: refresh public key, /names, /versions, every /packages/<name>,
   then download any new tarballs. Idempotent — files already on disk are
   skipped, and conditional GETs avoid redownloading unchanged registry payloads.
+
+  `opts[:housekeeping]` (default `true`) gates the tarball-store passes —
+  `refresh_stale_tarball_mtimes/0` and `cleanup/1`. Both call
+  `list_tarball_entries/1`, an O(tarball-count) `File.ls` + per-entry `File.stat`
+  walk of the whole store. Registry work (this function's `with` block) is
+  O(changed packages) after the versions-diff and cheap regardless of store
+  size; housekeeping is not, and on a large mirror on a shared/metered
+  filesystem (e.g. EFS) it dominates background IO cost. Pass
+  `housekeeping: false` to skip it on sweeps where registry freshness is
+  still wanted but the store walk isn't — see `HexMirror.MirrorWorker`, which
+  decouples the two cadences via `HexMirror.housekeeping_every_n_sweeps/0`.
+  Safe to skip on most sweeps: the correctness bound is
+  `unused_ttl_seconds / 2` (see `refresh_stale_tarball_mtimes/0`), far longer
+  than the registry-freshness cadence CI needs.
   """
-  def fetch do
+  def fetch(opts \\ []) do
+    housekeeping? = Keyword.get(opts, :housekeeping, true)
     ensure_dirs()
 
     result =
@@ -36,7 +51,7 @@ defmodule HexMirror.Mirror do
            {:ok, _names_body, _} <- get_and_save("/names", HexMirror.names_path()),
            {:ok, versions_body, versions_freshness} <-
              get_and_save("/versions", HexMirror.versions_path()) do
-        handle_versions(versions_freshness, versions_body, public_key)
+        handle_versions(versions_freshness, versions_body, public_key, housekeeping?)
       else
         {:error, reason} ->
           Logger.error("mirror sweep aborted: #{inspect(reason)}")
@@ -44,19 +59,20 @@ defmodule HexMirror.Mirror do
       end
 
     case result do
-      :ok ->
-        # Ordering: `handle_versions/3` already ran `refresh_stale_tarball_mtimes/0`
+      :ok when housekeeping? ->
+        # Ordering: `handle_versions/4` already ran `refresh_stale_tarball_mtimes/0`
         # (both the `:fresh` and `:not_modified` paths bump live tarballs past the
         # half-TTL threshold) BEFORE this `cleanup/1`. So `evict_unused/3`'s
         # `:os.system_time(:second)` cutoff sees the refreshed mtimes and keeps
         # the live keep-set. Do not reorder cleanup ahead of the sweep.
         cleanup()
 
-      {:error, _} ->
-        # Sweep failed (transport / decode error). Skip the TTL pass so a long
-        # upstream outage on a fresh pod cannot evict the keep-set, and skip
-        # the size cap so a misconfigured `max_bytes` cannot chew through the
-        # store while we are blind to upstream state.
+      _ ->
+        # Either the sweep failed (transport / decode error — skip the TTL pass
+        # so a long upstream outage on a fresh pod cannot evict the keep-set,
+        # and skip the size cap so a misconfigured `max_bytes` cannot chew
+        # through the store while we are blind to upstream state), or
+        # `housekeeping?` is false for this tick.
         :ok
     end
 
@@ -78,11 +94,22 @@ defmodule HexMirror.Mirror do
 
   Errors are logged, not raised. Cleanup never aborts the sweep.
 
-  Note: `fetch/0` only invokes `cleanup/1` when the sweep itself succeeded.
-  A failed sweep (transport / decode error) skips cleanup entirely so an
-  upstream outage on a fresh pod cannot evict the keep-set, and a
-  misconfigured `max_bytes` cannot chew through the store while we are blind
-  to upstream state. Manual `cleanup/1` callers always run all three passes.
+  Note: `fetch/1` only invokes `cleanup/1` when the sweep itself succeeded
+  AND `housekeeping?` is true for this tick (see `fetch/1`,
+  `HexMirror.housekeeping_every_n_sweeps/0`). A failed sweep (transport /
+  decode error) skips cleanup entirely so an upstream outage on a fresh pod
+  cannot evict the keep-set, and a misconfigured `max_bytes` cannot chew
+  through the store while we are blind to upstream state. A `housekeeping?
+  false` tick skips it too — deliberately: **all three passes above,
+  including the `max_bytes` hard cap and `keep_versions` pruning, are
+  gated together**, not just the TTL pass. There is no way to run the cap
+  or the pruning pass more often than the TTL pass without paying the
+  underlying `list_tarball_entries/1` walk again for that pass alone,
+  which defeats the point of gating it in the first place — see
+  `HexMirror.housekeeping_every_n_sweeps/0` for the resulting latency
+  this introduces on `max_bytes` enforcement, and size prod's `max_bytes`
+  with that latency in mind. Manual `cleanup/1` callers always run all
+  three passes, regardless of `housekeeping?`.
   """
   def cleanup(opts \\ []) do
     max_bytes = Keyword.get(opts, :max_bytes, HexMirror.max_bytes())
@@ -229,15 +256,16 @@ defmodule HexMirror.Mirror do
     end
   end
 
-  defp handle_versions(:not_modified, _versions_body, _public_key) do
+  defp handle_versions(:not_modified, _versions_body, _public_key, housekeeping?) do
     Logger.debug("/versions unchanged, skipping per-package sweep")
     # Refresh mtimes of every on-disk tarball whose mtime is already past the
     # half-window threshold, so the usage TTL pass treats a quiet upstream
     # (no new releases for `unused_ttl_seconds`) as healthy rather than as
     # evidence the keep-set is cold. Without this, a pre-populated PVC plus
     # a quiet week of 304s on `/versions` would let `evict_unused/3` wipe
-    # everything except the floor-newest per package.
-    refresh_stale_tarball_mtimes()
+    # everything except the floor-newest per package. Skipped when
+    # `housekeeping?` is false — see `Mirror.fetch/1`.
+    if housekeeping?, do: refresh_stale_tarball_mtimes()
     :ok
   end
 
@@ -266,7 +294,7 @@ defmodule HexMirror.Mirror do
   # on-disk reality. A manually deleted / partially-restored `/packages/<name>`
   # file is NOT re-reconciled until that package's fingerprint moves upstream.
   # Operational filesystem repair is out of scope for the normal sweep path.
-  defp handle_versions(:fresh, versions_body, public_key) do
+  defp handle_versions(:fresh, versions_body, public_key, housekeeping?) do
     case decode_versions_payload(versions_body, public_key) do
       {:ok, packages} ->
         new_map = versions_map(packages)
@@ -291,8 +319,10 @@ defmodule HexMirror.Mirror do
         # existing tarball, keeping the usage-TTL keep-set live. Diffing skips
         # unchanged packages, so refresh stale tarball mtimes explicitly here
         # (same call the `:not_modified` path uses). No-op in lazy mode, where
-        # tarballs are never mirrored and `unused_ttl_seconds <= 0` short-circuits.
-        refresh_stale_tarball_mtimes()
+        # tarballs are never mirrored and `unused_ttl_seconds <= 0`
+        # short-circuits. Skipped when `housekeeping?` is false — see
+        # `Mirror.fetch/1`.
+        if housekeeping?, do: refresh_stale_tarball_mtimes()
         :ok
 
       {:error, reason} ->

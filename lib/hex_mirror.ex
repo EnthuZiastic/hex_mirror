@@ -31,6 +31,7 @@ defmodule HexMirror do
   @default_unused_ttl_seconds 7 * 24 * 60 * 60
   @default_sweep_interval_ms 60_000
   @default_prefetch_tarballs true
+  @default_housekeeping_every_n_sweeps 1
 
   @doc "Hard cap on total tarball size after each sweep. Override via `HEX_MIRROR_MAX_BYTES`."
   def max_bytes, do: Application.get_env(:hex_mirror, :max_bytes, @default_max_bytes)
@@ -84,4 +85,51 @@ defmodule HexMirror do
   """
   def prefetch_tarballs?,
     do: Application.get_env(:hex_mirror, :prefetch_tarballs, @default_prefetch_tarballs)
+
+  @doc """
+  Run tarball-store housekeeping (`Mirror.fetch/1`'s `housekeeping?` pass —
+  `refresh_stale_tarball_mtimes/0` + `cleanup/1`) only 1-in-N sweeps, decoupled
+  from the registry-refresh cadence (`sweep_interval_ms/0`). Housekeeping is an
+  O(tarball-count) `File.ls` + per-entry `File.stat` walk of the whole store;
+  registry work is O(changed packages) after the versions-diff and stays cheap
+  regardless of store size. On a large mirror on a shared/metered filesystem
+  (e.g. EFS), housekeeping — not the registry diff — is the dominant
+  background IO cost, and it grows with the store as the mirror accumulates
+  packages, independent of sweep cadence.
+
+  Default `1` (housekeeping every sweep) preserves historical/test behavior.
+  Safe to raise well below `unused_ttl_seconds / (2 * sweep_interval_seconds)`
+  — that's the correctness bound documented on `Mirror.refresh_stale_tarball_mtimes/0`
+  (mtimes must be refreshed before crossing half the TTL window). At the
+  90-day prod TTL and 60-min sweep interval, that bound is ~1080 sweeps; a
+  daily cadence (24) leaves over a month of headroom.
+
+  Second-order effect worth weighing before raising this far: `cleanup/1`'s
+  `max_bytes` hard cap and `keep_versions` pruning are gated by the *same*
+  flag as the TTL pass (see `Mirror.cleanup/1`'s doc) — there's no cheaper
+  way to run just the cap without re-paying the store walk. Raising this
+  value delays `max_bytes` enforcement by roughly `housekeeping_every_n_sweeps
+  * sweep_interval_ms`, during which the store can grow past the configured
+  cap (bounded in practice by how fast new tarballs actually land —
+  `HexMirror.prefetch_tarballs?/0` `false` bounds growth to real CI cache
+  misses; `true` bounds it to `sweep_versions * changed packages per sweep`,
+  which can be much faster). Size `HexMirror.max_bytes/0` with that latency
+  headroom in mind, not just the steady-state store size.
+
+  Also note the cadence is tracked by an in-process tick counter in
+  `HexMirror.MirrorWorker` — it is not persisted, so it resets to 0 (i.e.
+  the next sweep after a restart always runs housekeeping) on every pod
+  restart. A pod restarting more often than once per `housekeeping_every_n_sweeps`
+  sweeps will see housekeeping closer to every-sweep than the configured
+  value in practice.
+
+  Override via `HEX_MIRROR_HOUSEKEEPING_EVERY_N_SWEEPS`.
+  """
+  def housekeeping_every_n_sweeps,
+    do:
+      Application.get_env(
+        :hex_mirror,
+        :housekeeping_every_n_sweeps,
+        @default_housekeeping_every_n_sweeps
+      )
 end
