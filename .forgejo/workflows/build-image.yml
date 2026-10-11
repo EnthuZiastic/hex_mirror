@@ -1,0 +1,85 @@
+name: Build Image
+
+# Forgejo port of .github/workflows/build-image.yml. Builds the production
+# Phoenix release container and pushes it to ECR (hex-mirror-prod, immutable
+# tags, SHA tag only).
+#
+# Differences from the GitHub copy:
+# - runs-on ubuntu-latest-docker (docker-mode pool with a dind sidecar).
+# - AWS auth: Forgejo has no OIDC federation into AWS, so this uses static
+#   keys for the ECR-push-only IAM user `forgejo-actions-hex-mirror`
+#   (tf-sre aws/services/forgejo/prod/iam-gha.tf), stored as repo secrets
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. Not the deploy-admin key.
+# - No $GITHUB_STEP_SUMMARY (not rendered by Forgejo); deploy hint is logged.
+# - .forgejo/** added to paths-ignore alongside .github/**.
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "README.md"
+      - "CLAUDE.md"
+      - ".github/**"
+      - ".forgejo/**"
+  workflow_dispatch:
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_DEFAULT_REGION: ap-south-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest-docker
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compute short SHA
+        id: sha
+        shell: bash
+        run: echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure aws cli and docker
+        shell: bash
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -fsSL --max-time 120 "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+          for c in aws docker; do echo "  $c: $(command -v "$c" || echo MISSING)"; done
+          docker version --format '{{.Server.Version}}'
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      - name: Build and push image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: hex-mirror-prod
+          SHORT_SHA: ${{ steps.sha.outputs.short }}
+        run: |
+          SHA_REF="${ECR_REGISTRY}/${ECR_REPOSITORY}:${SHORT_SHA}"
+          # No registry buildcache: hex-mirror-prod is image_tag_mutability=IMMUTABLE.
+          echo "Building ${SHA_REF}..."
+          docker buildx build -t "${SHA_REF}" --push .
+          echo "Pushed ${SHORT_SHA}"
+          echo "Deploy with: just tf-apply aws/services/forgejo/prod prod -var hex_mirror_image_tag=${SHORT_SHA} -var hex_mirror_enabled=true"
