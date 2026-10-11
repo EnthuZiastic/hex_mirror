@@ -1,0 +1,172 @@
+name: Claude Code
+
+# Ported from tf-sre's .forgejo/workflows/claude.yml. GitHub canon (.github/workflows/claude.yml) runs anthropics/claude-code-action@v1,
+# which shells out to `gh` for the diff/view/comment path and uses `id-token: write`
+# GitHub-OIDC App-token minting. Neither has a Forgejo equivalent — `gh` speaks
+# GitHub's REST schema only, and there is no Forgejo OIDC token-minting path. This
+# is the plain shell+CLI fallback: install `claude` directly, hand it the request,
+# post the reply via a direct Forgejo REST API call. Pattern copied from
+# main's .forgejo/workflows/claude.yml (tf-sre#22 ghost-queue cleanup).
+#
+# GitHub canon also triggers on pull_request_review_comment and pull_request_review.
+# Dropped here: a Forgejo PR is an issue with a diff attached, not a separate object
+# with its own comment stream, so issue_comment is expected to be the common
+# denominator for both — reasoned from the data model, not confirmed against
+# Forgejo's event trigger reference.
+#
+# Every comment on this repo (including Forgejo's own "Merge pull request
+# ..." system comment posted on merge) fires `issue_comment`, so the
+# @claude-mention gate matters even when nobody explicitly runs this
+# workflow. It was originally a job-level `if:` — that turned out to render
+# misleadingly on this Forgejo instance: a job-level `if: false` shows as
+# "Early termination" in the job log but reports the RUN's overall
+# conclusion as "Failure", not "Skipped" like GitHub does (confirmed live —
+# every one of every merged PR's merge comment produced a red
+# "claude" entry in the Actions list despite the workflow correctly never
+# running any real step). Moved the gate to a step-level check instead
+# (`should_run` output + `if:` on every later step) so a non-matching
+# comment now reports a normal successful run with skipped steps, same as
+# tf-fmt.yml's PR-comment step already does when there's no PR number.
+#
+# Verified via workflow_dispatch/test comment before merge for the
+# non-matching (gate=false) path — see PR description for the run link. NOT
+# live-verified for the matching (gate=true, real @claude mention) path —
+# that path spends real tokens and posts a real comment, so it needs an
+# actual @claude mention from a person, not an automated test.
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
+  workflow_dispatch: # Forgejo-only addition — lets the gate=false path be smoke-tested directly
+
+concurrency:
+  group: claude-mention-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  claude:
+    # ubuntu-latest-docker is the only org-scoped Forgejo Actions runner pool
+    # this org's repos are offered jobs from (confirmed live in main's deploy
+    # workflows). Same reasoning as claude-code-review.yml in this repo.
+    runs-on: ubuntu-latest-docker
+    timeout-minutes: 10
+    steps:
+      - name: Check for @claude mention
+        id: gate
+        run: |
+          set -euo pipefail
+          should_run=false
+          if [ "${{ github.event_name }}" = "issue_comment" ] && [ "${{ contains(github.event.comment.body, '@claude') }}" = "true" ]; then
+            should_run=true
+          elif [ "${{ github.event_name }}" = "issues" ] && { [ "${{ contains(github.event.issue.body, '@claude') }}" = "true" ] || [ "${{ contains(github.event.issue.title, '@claude') }}" = "true" ]; }; then
+            should_run=true
+          fi
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+
+      - name: Check commenter is a repo collaborator
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          FORGEJO_TOKEN: ${{ secrets.REVIEW_BOT_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: token ${FORGEJO_TOKEN}" \
+            "https://git.enthu.net/api/v1/repos/${{ github.repository }}/collaborators/${ACTOR}")
+          if [ "$HTTP_CODE" != "204" ]; then
+            echo "::error::@${ACTOR} is not a collaborator on this repo (HTTP $HTTP_CODE) — refusing to run Claude on their behalf."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          show-progress: false
+          fetch-depth: 1
+
+      - name: Install claude CLI
+        if: steps.gate.outputs.should_run == 'true'
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 120 https://claude.ai/install.sh | bash
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v claude || { echo "::error::claude CLI not on PATH after install"; exit 1; }
+          claude --version
+
+      - name: Determine target issue/PR number
+        if: steps.gate.outputs.should_run == 'true'
+        id: target
+        run: |
+          set -euo pipefail
+          NUM="${{ github.event.issue.number }}"
+          if [ -z "$NUM" ]; then
+            echo "::error::No issue/PR number on this event — refusing to guess where to post a reply."
+            exit 1
+          fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude Code
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.ORG_CLAUDE_CODE_OAUTH_TOKEN }}
+          REVIEW_MODEL: ${{ vars.ORG_CLAUDE_CODE_REVIEW_MODEL }}
+          REQUEST_BODY: ${{ github.event.comment.body }}
+          FALLBACK_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          MODEL="${REVIEW_MODEL:-claude-opus-4-8}"
+          printf '%s' "${REQUEST_BODY:-$FALLBACK_BODY}" > /tmp/request.txt
+
+          claude -p "Someone mentioned @claude on this repository. Their message is in /tmp/request.txt. Do what they asked, scoped to reading and explaining this repository's code (Elixir/Phoenix hex package mirror) — you cannot push commits or open PRs from this job. Write your reply as markdown." \
+            --model "$MODEL" \
+            --allowedTools "Read,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git diff:*)" \
+            --output-format text \
+            --print > /tmp/reply.md
+
+          if [ ! -s /tmp/reply.md ]; then
+            echo "::error::Claude produced an empty reply — refusing to post nothing."
+            exit 1
+          fi
+
+      - name: Post reply comment
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          FORGEJO_TOKEN: ${{ secrets.REVIEW_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          NUM="${{ steps.target.outputs.number }}"
+
+          python3 -c "
+          import json
+          with open('/tmp/reply.md') as f:
+              body = f.read()
+          with open('/tmp/comment.json', 'w') as f:
+              json.dump({'body': body}, f)
+          "
+
+          RESP=$(mktemp)
+          HTTP_CODE=$(curl -s -o "$RESP" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: token ${FORGEJO_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data @/tmp/comment.json \
+            "https://git.enthu.net/api/v1/repos/${{ github.repository }}/issues/${NUM}/comments")
+
+          echo "Forgejo comment POST: HTTP $HTTP_CODE"
+          cat "$RESP"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Comment POST failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          COMMENT_URL=$(python3 -c "import json; print(json.load(open('$RESP')).get('html_url',''))")
+          echo "Posted: $COMMENT_URL"

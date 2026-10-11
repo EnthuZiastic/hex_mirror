@@ -1,0 +1,143 @@
+name: Claude Code Review
+
+# GitHub canon (.github/workflows/claude-code-review.yml) runs
+# anthropics/claude-code-action@v1 via the code-review plugin, which shells out
+# to `gh pr comment/diff/view` and uses `id-token: write` GitHub-OIDC minting.
+# Both are architectural GitHub-only mechanisms — no amount of runner egress
+# fixes them. This is the plain shell+CLI fallback: install `claude` directly,
+# hand it the diff, post the result via a direct Forgejo REST API call.
+# Pattern copied from main's .forgejo/workflows/claude-code-review.yml
+# (tf-sre#22 ghost-queue cleanup — that file's commit message has the full
+# incident history behind each design choice below).
+#
+# NOT LIVE-VERIFIED yet — first real PR opened against master after this
+# lands is the actual test.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  claude-review:
+    if: github.event.pull_request.draft == false || github.event.action == 'ready_for_review'
+    # ubuntu-latest-docker: the only org-scoped Forgejo Actions runner pool.
+    # The host-mode `ubuntu-latest` pool is registered "Individual" scope and
+    # invisible to org repos (confirmed in main's deploy workflows).
+    runs-on: ubuntu-latest-docker
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          show-progress: false
+          fetch-depth: 0
+          # Full history: the diff step below needs the PR base ref present
+          # locally to `git diff` against.
+
+      - name: Install claude CLI
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 120 https://claude.ai/install.sh | bash
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v claude || { echo "::error::claude CLI not on PATH after install"; exit 1; }
+          claude --version
+
+      - name: Compute PR diff
+        id: pr
+        run: |
+          set -euo pipefail
+          NUM="${{ github.event.pull_request.number }}"
+          if [ -z "$NUM" ]; then
+            echo "::error::github.event.pull_request.number is empty — aborting rather than posting to an unknown PR."
+            exit 1
+          fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+
+          BASE="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "$BASE"
+          git diff "origin/${BASE}...HEAD" > "$GITHUB_WORKSPACE/pr.diff"
+          if [ ! -s "$GITHUB_WORKSPACE/pr.diff" ]; then
+            echo "::warning::Empty diff computed for PR #${NUM} — review step will note this rather than fabricate findings."
+          fi
+
+      - name: Run Claude Code review
+        timeout-minutes: 20
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.ORG_CLAUDE_CODE_OAUTH_TOKEN }}
+          REVIEW_MODEL: ${{ vars.ORG_CLAUDE_CODE_REVIEW_MODEL }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          MODEL="${REVIEW_MODEL:-claude-opus-4-8}"
+
+          # Read-only allowlist: this step only produces the review text.
+          # Posting is a separate step below so a failed post can never be
+          # masked by a successful review generation.
+          #
+          # --safe-mode disables this repo's CLAUDE.md/skills/hooks for this
+          # call so the review isn't hijacked by an unrelated standing
+          # instruction (confirmed failure mode in main's port of this same
+          # workflow: CLAUDE.md's own "run this checklist every session"
+          # directive ran instead of the diff review it was asked for).
+          # hex_mirror-specific guardrails are reintroduced explicitly below.
+          GUARDRAILS="When reviewing, also check the diff against these repo-specific rules:
+          - hex-mirror-prod ECR repo is image_tag_mutability=IMMUTABLE: never publish a rolling tag (e.g. latest) or re-push an existing tag in the build workflow.
+          - Mirror metadata is served local-only: changes to sweep/refresh cadence affect dependency staleness and upstream (repo.hex.pm) request volume — call out anything that re-walks all packages.
+          - Tarball/store walks on EFS are expensive (many small GETATTRs): flag new full-directory scans on the store.
+          - Never commit real credentials, tokens or .env files."
+          claude -p "Review the diff at \$GITHUB_WORKSPACE/pr.diff for correctness bugs, risky patterns, and reuse/simplification opportunities in this Elixir/Phoenix hex mirror repo. Read any file under the working directory for context on the surrounding code. Write a concise, actionable code review as markdown with file:line references. No preamble, no restating the diff." \
+            --safe-mode \
+            --append-system-prompt "$GUARDRAILS" \
+            --model "$MODEL" \
+            --allowedTools "Read,Grep,Glob" \
+            --output-format text \
+            --print > /tmp/review.md
+
+          if [ ! -s /tmp/review.md ]; then
+            echo "::error::Claude produced an empty review — refusing to post nothing as if it were a completed review."
+            exit 1
+          fi
+
+      - name: Post review comment
+        timeout-minutes: 2
+        env:
+          FORGEJO_TOKEN: ${{ secrets.REVIEW_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          NUM="${{ steps.pr.outputs.number }}"
+
+          python3 -c "
+          import json
+          with open('/tmp/review.md') as f:
+              body = f.read()
+          with open('/tmp/comment.json', 'w') as f:
+              json.dump({'body': body}, f)
+          "
+
+          RESP=$(mktemp)
+          HTTP_CODE=$(curl -s --max-time 60 -o "$RESP" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: token ${FORGEJO_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data @/tmp/comment.json \
+            "https://git.enthu.net/api/v1/repos/${{ github.repository }}/issues/${NUM}/comments")
+
+          echo "Forgejo comment POST: HTTP $HTTP_CODE"
+          cat "$RESP"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Comment POST failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          COMMENT_URL=$(python3 -c "import json; print(json.load(open('$RESP')).get('html_url',''))")
+          echo "Posted: $COMMENT_URL"
