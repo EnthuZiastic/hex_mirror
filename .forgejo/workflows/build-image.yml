@@ -61,6 +61,13 @@ jobs:
           for c in aws docker; do echo "  $c: $(command -v "$c" || echo MISSING)"; done
           docker version --format '{{.Server.Version}}'
 
+      - name: Set writable Docker config dir
+        working-directory: .
+        run: |
+          DOCKER_DIR="/tmp/docker-config-${{ github.run_id }}"
+          mkdir -p "$DOCKER_DIR"
+          echo "DOCKER_CONFIG=$DOCKER_DIR" >> $GITHUB_ENV
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
